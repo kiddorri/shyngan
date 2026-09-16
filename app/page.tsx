@@ -211,7 +211,7 @@ export default function Home() {
 
           {selected && (
             <aside
-              style={{ position: "fixed", right: 16, bottom: 16, width: 360, maxWidth: "calc(100% - 32px)", background: "#fff", border: "1px solid #999", padding: 12, fontSize: 13 }}
+              style={{ position: "fixed", right: 16, bottom: 16, width: 360, maxWidth: "calc(100% - 32px)", background: "#fff", color: "#111", border: "1px solid #999", padding: 12, fontSize: 13 }}
             >
               <strong>Почему это фото здесь</strong>
               <ul style={{ paddingLeft: 18, margin: "6px 0" }}>

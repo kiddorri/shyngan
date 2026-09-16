@@ -66,7 +66,10 @@ function assessTrust(
   anchor: Anchor | null,
   anchorPlaceId: string | null,
 ): { trust: TrustTier; distanceM: number | null; reasons: string[] } {
-  const reasons: string[] = [`Место найдено через Google Places (place_id ${place.id})`];
+  const reasons: string[] = [
+    `Место найдено через Google Places (place_id ${place.id})`,
+    "Проверено место, а не содержимое снимка: фотография загружена пользователем на страницу этого места в Google Places",
+  ];
 
   if (anchorPlaceId && place.id === anchorPlaceId) {
     reasons.push("Якорные координаты взяты из этого же места — расстояние с ним ничего не подтверждает");
@@ -112,7 +115,6 @@ function assessTrust(
   );
   if (anchor.source === "places") trust = downgrade(trust);
 
-  reasons.push("Проверено место, а не содержимое снимка: фотография загружена пользователем на страницу этого места в Google Places");
   return { trust, distanceM, reasons };
 }
 
