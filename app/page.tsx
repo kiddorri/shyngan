@@ -15,9 +15,9 @@ import {
 } from "@/lib/types";
 
 const TRUST_LABELS: Record<TrustTier, string> = {
-  verified: "Подтверждено",
-  probable: "Вероятно",
-  unverified: "Не подтверждено",
+  verified: "Место подтверждено",
+  probable: "Место вероятно",
+  unverified: "Место не подтверждено",
 };
 
 const TRUST_COLORS: Record<TrustTier, string> = {

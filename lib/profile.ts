@@ -112,6 +112,7 @@ function assessTrust(
   );
   if (anchor.source === "places") trust = downgrade(trust);
 
+  reasons.push("Проверено место, а не содержимое снимка: фотография загружена пользователем на страницу этого места в Google Places");
   return { trust, distanceM, reasons };
 }
 
