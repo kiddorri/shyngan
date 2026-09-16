@@ -64,8 +64,15 @@ function assessTrust(
   place: Place,
   category: Category,
   anchor: Anchor | null,
+  anchorPlaceId: string | null,
 ): { trust: TrustTier; distanceM: number | null; reasons: string[] } {
   const reasons: string[] = [`Место найдено через Google Places (place_id ${place.id})`];
+
+  if (anchorPlaceId && place.id === anchorPlaceId) {
+    reasons.push("Якорные координаты взяты из этого же места — расстояние с ним ничего не подтверждает");
+    reasons.push("Независимой географической проверки нет: место найдено только по совпадению названия");
+    return { trust: "unverified", distanceM: null, reasons };
+  }
 
   if (!anchor) {
     reasons.push("Якорных координат нет — расстояние не проверялось");
@@ -114,11 +121,12 @@ async function placeToPhotos(
   place: Place,
   category: Category,
   anchor: Anchor | null,
+  anchorPlaceId: string | null,
 ): Promise<PhotoItem[]> {
   const photos = (place.photos ?? []).slice(0, PHOTOS_PER_PLACE);
   if (photos.length === 0) return [];
 
-  const { trust, distanceM, reasons } = assessTrust(place, category, anchor);
+  const { trust, distanceM, reasons } = assessTrust(place, category, anchor, anchorPlaceId);
   const placeName = place.displayName?.text ?? place.id;
 
   const uris = await Promise.all(photos.map((p) => getPhotoUri(p.name)));
@@ -209,6 +217,8 @@ export async function buildProfile(university: UniversityCandidate): Promise<Pro
     warnings.push("Координаты кампуса не найдены ни в Wikidata, ни в Places — проверка расстояния невозможна");
   }
 
+  const anchorPlaceId = anchor?.source === "places" ? (campusPlace?.id ?? null) : null;
+
   // 3. Остальные запросы — параллельно, с якорем как locationBias.
   const bias = anchor ? { lat: anchor.lat, lon: anchor.lon, radiusM: SEARCH_BIAS_RADIUS_M } : undefined;
 
@@ -247,7 +257,7 @@ export async function buildProfile(university: UniversityCandidate): Promise<Pro
 
   // 5. Фото — параллельно по всем местам.
   const photoGroups = await Promise.all(
-    jobs.map((j) => placeToPhotos(j.place, j.category, anchor)),
+    jobs.map((j) => placeToPhotos(j.place, j.category, anchor, anchorPlaceId)),
   );
   const photos = photoGroups.flat().slice(0, MAX_PHOTOS_TOTAL);
 
