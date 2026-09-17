@@ -27,6 +27,9 @@ const IMG_LOGO = await jpeg(200, 100, "#ffffff");       // мелкая икон
 const IMG_OFF = await svgJpeg(1400, 900, `<rect width="1400" height="900" fill="#c9d6df"/><polygon points="700,100 1300,800 100,800" fill="#553"/>`); // официальное фото
 const IMG_OFF3 = await svgJpeg(1200, 800, `<rect width="1200" height="800" fill="#eee"/><rect x="0" y="400" width="1200" height="400" fill="#246"/><circle cx="300" cy="200" r="120" fill="#fc0"/>`); // снимок из внутренней галереи
 const IMG_OFF2 = await svgJpeg(1300, 900, `<rect width="1300" height="900" fill="#fff"/><rect x="100" y="100" width="1100" height="700" fill="none" stroke="#000" stroke-width="60"/>`); // второе официальное
+const IMG_OFF4 = await svgJpeg(1200, 900, `<rect width="1200" height="900" fill="#fff"/>${Array.from({length: 8}, (_, i) => `<polygon points="${i * 150},900 ${i * 150 + 80},900 ${i * 150 + 220},0 ${i * 150 + 140},0" fill="#135"/>`).join("")}`); // снимок из фотоальбома
+const IMG_OFF5 = await svgJpeg(1100, 800, `<rect width="1100" height="800" fill="#eee"/>${Array.from({length: 16}, (_, i) => (i % 4 + Math.floor(i / 4)) % 2 === 0 ? `<rect x="${(i % 4) * 275}" y="${Math.floor(i / 4) * 200}" width="275" height="200" fill="#420"/>` : "").join("")}`); // фон раздела «Кампус»
+const IMG_OFF6 = await svgJpeg(1000, 900, `<rect width="1000" height="900" fill="#9ab"/><circle cx="250" cy="250" r="230" fill="#fff"/><rect x="520" y="500" width="440" height="360" fill="#000"/>`); // фон из блока <style> на главной
 
 // ---- 1. dHash / hamming ----
 const { dHash, hamming } = await import("./lib/image.ts");
@@ -43,6 +46,7 @@ const captured: { gemini: any[]; twogis: string[]; places: any[] } = { gemini: [
 
 const OFFICIAL_HTML = `<html><head>
 <meta property="og:image" content="/img/hero.jpg">
+<style>.cover{background:url('/img/bg-hall.jpg') no-repeat center}</style>
 </head><body>
 <img src="/img/logo.png">
 <img data-src="https://cdn.example.edu/campus.jpg" src="data:image/gif;base64,R0lGOD">
@@ -50,8 +54,11 @@ const OFFICIAL_HTML = `<html><head>
 <img src="/icons/i.svg">
 <a href="/dlya-inostrannyh-abiturientov/">Для иностранных абитуриентов</a>
 <a href="/fakultet-arhitektury/">Факультет архитектуры</a>
+<a href="/studencheskaya-zhizn">Студенческая жизнь</a>
 <a href="/gallery">Фотогалерея кампуса</a>
 <a href="/virtualnyj-tur">Виртуальный тур по кампусу</a>
+<a href="/fotoalbom">Фотоальбом выпуска</a>
+<a href="/kampus">Наш кампус</a>
 <a href="/contacts">Контакты</a>
 <a href="https://other.example.com/gallery">Чужая галерея</a>
 </body></html>`;
@@ -62,6 +69,10 @@ const GALLERY_HTML = `<html><body>
 
 // Страница тура: плеер панорам, отдельных файлов-снимков нет.
 const TOUR_HTML = `<html><body><div id="pano"></div></body></html>`;
+
+const ALBUM_HTML = `<html><body><img src="/img/album1.jpg"></body></html>`;
+// Плитка раздела задана CSS-фоном: в <img> такого снимка нет вообще.
+const KAMPUS_HTML = `<html><body><div class="tile" style="background-image:url(/img/yard.jpg)"></div></body></html>`;
 
 const placeCampus = {
   id: "P_CAMPUS", displayName: { text: "Тестовый Университет" }, formattedAddress: "просп. Тестовый, 1, Астана",
@@ -140,13 +151,26 @@ globalThis.fetch = (async (input: any, init?: any) => {
   if (u.hostname === "example.edu" && u.pathname === "/virtualnyj-tur") {
     return new Response(TOUR_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
   }
+  if (u.hostname === "example.edu" && u.pathname === "/fotoalbom") {
+    return new Response(ALBUM_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+  }
+  if (u.hostname === "example.edu" && u.pathname === "/kampus") {
+    return new Response(KAMPUS_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+  }
   if (u.hostname === "example.edu" && u.pathname === "/contacts") throw new Error("контакты не должны запрашиваться");
+  // Ранг ссылки важнее порядка в вёрстке: «Студенческая жизнь» стоит в HTML первой,
+  // но бюджет страниц должен уйти на галереи, тур и раздел про кампус. Именно так
+  // обход раньше тратил вторую страницу на «конференции студентов» у КазНУИ.
+  if (u.hostname === "example.edu" && u.pathname === "/studencheskaya-zhizn") throw new Error("слабая ссылка не должна вытеснять галереи");
   // Основа «тур» раньше совпадала с «абиТУРиент» и «архитекТУРа» — обход тратил
   // бюджет страниц на разделы без фотографий.
   if (u.hostname === "example.edu" && u.pathname === "/dlya-inostrannyh-abiturientov/") throw new Error("«абитуриенты» не должны запрашиваться");
   if (u.hostname === "example.edu" && u.pathname === "/fakultet-arhitektury/") throw new Error("«архитектура» не должна запрашиваться");
   if (u.hostname === "other.example.com") throw new Error("чужой домен не должен запрашиваться");
   if (u.hostname === "example.edu" && u.pathname === "/img/inner.jpg") return new Response(IMG_OFF3, { headers: { "content-type": "image/jpeg" } });
+  if (u.hostname === "example.edu" && u.pathname === "/img/album1.jpg") return new Response(IMG_OFF4, { headers: { "content-type": "image/jpeg" } });
+  if (u.hostname === "example.edu" && u.pathname === "/img/yard.jpg") return new Response(IMG_OFF5, { headers: { "content-type": "image/jpeg" } });
+  if (u.hostname === "example.edu" && u.pathname === "/img/bg-hall.jpg") return new Response(IMG_OFF6, { headers: { "content-type": "image/jpeg" } });
   if (u.hostname === "example.edu" && u.pathname === "/img/hero.jpg") return new Response(IMG_OFF, { headers: { "content-type": "image/jpeg" } });
   if (u.hostname === "example.edu" && u.pathname === "/img/logo.png") return new Response(IMG_LOGO, { headers: { "content-type": "image/png" } });
   if (u.hostname === "example.edu" && u.pathname === "/img/hero-small.jpg") return new Response(IMG_OFF, { headers: { "content-type": "image/jpeg" } });
@@ -203,14 +227,26 @@ const { collectOfficialImages } = await import("./lib/official.ts");
 const off = await collectOfficialImages("https://example.edu", "t");
 assert.equal(off.error, null);
 const offUrls = off.candidates.map((c) => c.url);
+// Бюджет кандидатов идёт по кругу: первая картинка каждой страницы, потом вторая и так
+// далее. Иначе четыре изображения главной занимают начало списка целиком.
 assert.deepEqual(offUrls, [
-  "https://example.edu/img/hero.jpg",          // og:image первым
-  "https://example.edu/img/logo.png",
+  "https://example.edu/img/hero.jpg",          // og:image — первая с главной
+  "https://example.edu/img/inner.jpg",         // галерея
+  "https://example.edu/img/album1.jpg",        // фотоальбом
+  "https://example.edu/img/yard.jpg",          // CSS-фон в разделе «Кампус»
+  "https://example.edu/img/logo.png",          // второй круг: снова главная
   "https://cdn.example.edu/campus.jpg",        // data-src, data: пропущен
-  "https://example.edu/img/inner.jpg",         // со второго уровня: галерея
+  "https://example.edu/img/bg-hall.jpg",       // фон из блока <style> на главной
 ]);
-// Прочитаны галерея и тур; «абитуриенты» и «архитектура» отсеяны (иначе мок бросит ошибку).
-assert.deepEqual(off.pagesVisited, ["https://example.edu/", "https://example.edu/gallery", "https://example.edu/virtualnyj-tur"]);
+// Прочитаны галерея, тур, фотоальбом и раздел «Кампус»; «абитуриенты», «архитектура»
+// и слабая «Студенческая жизнь» отсеяны (иначе мок бросит ошибку).
+assert.deepEqual(off.pagesVisited, [
+  "https://example.edu/",
+  "https://example.edu/gallery",
+  "https://example.edu/virtualnyj-tur",
+  "https://example.edu/fotoalbom",
+  "https://example.edu/kampus",
+]);
 console.log("обход второго уровня ok:", off.pagesVisited);
 // снимок из галереи должен дойти до профиля, а не потеряться
 
@@ -237,8 +273,16 @@ assert.equal(await getUniversityByAnyId("places:P_NOPE"), null);
 assert.equal(await getUniversityByAnyId("places:P_BADID"), null);
 console.log("place details ok:", byPlace!.label);
 
+// ---- 4c. распределение бюджета снимков между местами ----
+const { buildProfile, interleave } = await import("./lib/profile.ts");
+// Место с тремя снимками не должно съедать бюджет: хвост плана (столовая, музей)
+// обязан получить свою долю, иначе категория пустует не из-за отсутствия снимков.
+assert.deepEqual(interleave([["a1", "a2", "a3"], ["b1"], ["c1", "c2"]], 4), ["a1", "b1", "c1", "a2"]);
+assert.deepEqual(interleave([["a1", "a2"], ["b1"]], 10), ["a1", "b1", "a2"]);
+assert.deepEqual(interleave([], 5), []);
+console.log("распределение бюджета ok");
+
 // ---- 5. полный профиль ----
-const { buildProfile } = await import("./lib/profile.ts");
 const events: any[] = [];
 const profile = await buildProfile(
   { qid: "Q1", resolvedVia: "sparql" as const, label: "Тестовый Университет", lat: null, lon: null, officialWebsite: "https://example.edu", country: "Казахстан", city: "Астана", image: null, instanceOf: "университет" },
@@ -261,6 +305,13 @@ assert.equal(captured.gemini[0].body.generationConfig.response_schema.type, "ARR
 // Мелкий логотип отсеян по размеру, копии — как дубли
 assert.equal(profile.removed.tooSmall, 1);
 assert.equal(profile.removed.duplicates, 1); // a2 — пережатая копия a
+const queries: string[] = captured.places.map((b) => b.textQuery);
+for (const part of ["учебный корпус", "актовый зал", "столовая", "коворкинг", "музей"]) {
+  assert.ok(queries.some((q: string) => q.includes(part)), `в плане поиска нет запроса «${part}»: ${queries.join(" | ")}`);
+}
+console.log("план запросов ok:", queries.length, "запросов");
+const fromCss = profile.photos.find((p) => p.imageUrl.endsWith("/img/yard.jpg"));
+assert.ok(fromCss && fromCss.source === "official_site", "снимок из CSS-фона дошёл до профиля");
 const fromGallery = profile.photos.find((p) => p.imageUrl.endsWith("/img/inner.jpg"));
 assert.ok(fromGallery && fromGallery.source === "official_site", "снимок из внутренней галереи дошёл до профиля");
 console.log("снимок из галереи в профиле:", fromGallery!.evidence.reasons[0]);

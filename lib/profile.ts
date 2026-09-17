@@ -73,6 +73,13 @@ const QUERY_PLAN: QueryPlanItem[] = [
   { category: "library", build: (u) => `${u.label} библиотека`, pageSize: 2 },
   { category: "lab", build: (u) => `${u.label} лаборатория`, pageSize: 2 },
   { category: "sport", build: (u) => `${u.label} спортивный комплекс`, pageSize: 2 },
+  // Места, которые студент видит каждый день, но которых не было в плане.
+  // «Актовый зал» ищем отдельно от учебных корпусов: в Places это чаще самостоятельное
+  // место, а внутри — ряды кресел и сцена, то есть ровно та категория, которая пустует.
+  { category: "lecture", build: (u) => `${u.label} актовый зал`, pageSize: 1 },
+  { category: "life", build: (u) => `${u.label} столовая`, pageSize: 1 },
+  { category: "life", build: (u) => `${u.label} коворкинг`, pageSize: 1 },
+  { category: "life", build: (u) => `${u.label} музей`, pageSize: 1 },
   // Окружение кампуса ищем рядом с якорем, а не по названию города: студенту
   // полезен парк в десяти минутах ходьбы, а не панорама центра в восьми километрах.
   { category: "city", build: () => "парк", pageSize: 1, biasRadiusM: NEIGHBORHOOD_BIAS_RADIUS_M },
@@ -231,6 +238,25 @@ function shortPath(pageUrl: string): string {
   }
 }
 
+// ---- Распределение бюджета ----
+
+/** Берёт по одному элементу из каждой группы по кругу, пока не наберётся limit.
+ *  Экспортируется для оффлайн-теста. */
+export function interleave<T>(groups: T[][], limit: number): T[] {
+  const out: T[] = [];
+  for (let i = 0; out.length < limit; i++) {
+    let anyLeft = false;
+    for (const group of groups) {
+      if (i >= group.length) continue;
+      anyLeft = true;
+      out.push(group[i]);
+      if (out.length >= limit) break;
+    }
+    if (!anyLeft) break;
+  }
+  return out;
+}
+
 // ---- Покрытие ----
 
 function computeCoverage(photos: PhotoItem[]): CategoryCoverage[] {
@@ -352,9 +378,11 @@ export async function buildProfile(
     }
   }
 
-  const placesRaw = (await Promise.all(jobs.map((j) => placeToRaw(j.place, j.category, anchor, anchorPlaceId))))
-    .flat()
-    .slice(0, MAX_PLACES_PHOTOS);
+  // Бюджет снимков делим между местами по кругу, а не обрезаем хвост плана: иначе три
+  // фотографии главного корпуса вытесняют единственный снимок общежития или столовой,
+  // и категория остаётся пустой не потому, что снимков не нашлось.
+  const perPlace = await Promise.all(jobs.map((j) => placeToRaw(j.place, j.category, anchor, anchorPlaceId)));
+  const placesRaw = interleave(perPlace, MAX_PLACES_PHOTOS);
   onProgress({ stage: "places", found: placesRaw.length });
 
 
