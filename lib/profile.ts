@@ -44,6 +44,8 @@ const CORROBORATION_RADIUS_M = 500;
 const PHOTOS_PER_PLACE = 5;
 const MAX_PLACES_PHOTOS = 40;
 const MAX_OFFICIAL_PHOTOS = 10;
+/** Город — контекст, а не кампус: держим его небольшим, чтобы он не забивал профиль. */
+const MAX_CITY_PHOTOS = 3;
 const MIN_WIDTH_PX = 500;
 const MIN_HEIGHT_PX = 300;
 /** Хэммингово расстояние между dHash, при котором снимки считаются дублями. */
@@ -88,6 +90,10 @@ type Loaded = { raw: RawPhoto; img: LoadedImage; hash: string };
 
 const TIER_RANK: Record<TrustTier, number> = { verified: 0, probable: 1, unverified: 2 };
 const SOURCE_RANK: Record<PhotoSource, number> = { official_site: 0, google_places: 1 };
+/** Порядок вывода: объекты вуза впереди, город последним. */
+const CATEGORY_RANK: Record<Category, number> = {
+  campus: 0, dorm: 1, library: 2, lab: 3, sport: 4, life: 5, city: 6,
+};
 
 // ---- Доверие по расстоянию ----
 
@@ -457,7 +463,16 @@ export async function buildProfile(
     });
   }
 
-  // 8. Итоги.
+  // 8. Город ограничиваем и ставим в конец: это контекст, а не объекты вуза.
+  const cityPhotos = photos.filter((p) => p.category === "city").slice(0, MAX_CITY_PHOTOS);
+  const rest = photos.filter((p) => p.category !== "city");
+  const ordered = [...rest, ...cityPhotos].sort(
+    (a, b) => CATEGORY_RANK[a.category] - CATEGORY_RANK[b.category] || TIER_RANK[a.trust] - TIER_RANK[b.trust],
+  );
+  photos.length = 0;
+  photos.push(...ordered);
+
+  // 9. Итоги.
   const coverage = computeCoverage(photos);
   const description = describeCampus(university, anchor, photos, coverage);
   if (photos.length === 0) warnings.push("Ни одной фотографии не прошло проверку — профиль пуст");

@@ -52,9 +52,15 @@ function progressText(e: ProgressEvent): string {
   }
 }
 
+/** Метры до километров: «8.6 км» и «107 м» читаются как разные порядки величины,
+ *  и это снимает путаницу, не добавляя утверждений сверх измеренного. */
+function formatDistance(m: number): string {
+  return m >= 1000 ? `${(m / 1000).toFixed(1)} км` : `${m} м`;
+}
+
 function badgeText(p: PhotoItem): string {
   const base = TRUST_LABELS[p.trust];
-  const dist = p.evidence.distanceM !== null ? ` · ${p.evidence.distanceM} м` : "";
+  const dist = p.evidence.distanceM !== null ? ` · ${formatDistance(p.evidence.distanceM)} от кампуса` : "";
   const content = p.evidence.vision ? "" : " · содержимое не проверено";
   return base + dist + content;
 }

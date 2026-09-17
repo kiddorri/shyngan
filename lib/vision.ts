@@ -1,6 +1,6 @@
 // lib/vision.ts
 // Проверка содержимого снимков через Gemini API (generateContent, structured output).
-// Один вызов = батч до 8 изображений. Модель отвечает строгим JSON по схеме.
+// Один вызов = батч до 4 изображений с одной повторной попыткой. Строгий JSON по схеме.
 //
 // Честная граница: модель определяет, ЧТО изображено (здание вуза, общежитие, город,
 // логотип, документ…) и какая это категория. Она НЕ может подтвердить, что это именно
@@ -10,10 +10,10 @@ import type { Category, VisionVerdict } from "./types";
 
 const GEMINI_MODEL = "gemini-3.8-flash";
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-const BATCH_SIZE = 8;
+const BATCH_SIZE = 4;
 /** Сколько батчей отправляем одновременно. Держим низко, чтобы не упереться в RPM. */
 const CONCURRENCY = 3;
-const REQUEST_TIMEOUT_MS = 25000;
+const REQUEST_TIMEOUT_MS = 30000;
 
 const CATEGORY_ENUM = ["campus", "dorm", "library", "lab", "sport", "life", "city", "other"] as const;
 const CONFIDENCE_ENUM = ["high", "medium", "low"] as const;
@@ -160,12 +160,21 @@ export async function classifyImages(
   async function worker(): Promise<void> {
     while (cursor < batches.length) {
       const batch = batches[cursor++];
-      try {
-        const partial = await classifyBatch(batch, ctx);
-        partial.forEach((v, k) => verdicts.set(k, v));
-      } catch (e) {
-        errors.push((e as Error).message);
+      // Одна повторная попытка: таймаут или 429 на одном батче не должны
+      // оставлять снимки без вердикта — иначе они молча теряют категорию.
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const partial = await classifyBatch(batch, ctx);
+          partial.forEach((v, k) => verdicts.set(k, v));
+          lastError = null;
+          break;
+        } catch (e) {
+          lastError = e;
+          if (attempt === 0) await new Promise((r) => setTimeout(r, 1500));
+        }
       }
+      if (lastError) errors.push((lastError as Error).message);
     }
   }
 
