@@ -196,7 +196,7 @@ export default function Home() {
 
       {loading === "profile" && (
         <div style={{ marginBottom: 16, fontSize: 14, color: "#555" }}>
-          <div>Собираю профиль… обычно 10–20 секунд: поиск мест, загрузка снимков, проверка содержимого.</div>
+          <div>Собираю профиль… обычно менее 30 секунд: поиск мест, загрузка снимков, проверка содержимого.</div>
           <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
             {progress.map((line, i) => <li key={i}>{line}</li>)}
           </ul>
