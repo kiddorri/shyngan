@@ -6,6 +6,7 @@ export type TrustTier = "verified" | "probable" | "unverified";
 
 export type Category =
   | "campus"
+  | "lecture"
   | "dorm"
   | "library"
   | "lab"
@@ -15,6 +16,7 @@ export type Category =
 
 export const CATEGORY_LABELS: Record<Category, string> = {
   campus: "Кампус",
+  lecture: "Аудитории",
   dorm: "Общежитие",
   library: "Библиотека",
   lab: "Лаборатории",
@@ -23,7 +25,7 @@ export const CATEGORY_LABELS: Record<Category, string> = {
   city: "Вокруг кампуса",
 };
 
-export const ALL_CATEGORIES: Category[] = ["campus", "dorm", "library", "lab", "sport", "life", "city"];
+export const ALL_CATEGORIES: Category[] = ["campus", "lecture", "dorm", "library", "lab", "sport", "life", "city"];
 
 /** Откуда снимок. official_site — опубликован на сайте вуза; google_places — загружен посетителем. */
 export type PhotoSource = "google_places" | "official_site";
@@ -92,6 +94,8 @@ export type PhotoItem = {
   attribution: Attribution[];
   /** Ни Places, ни главная страница сайта не отдают дату публикации — всегда null. Не выдумывать. */
   publishedAt: null;
+  /** Момент получения снимка (ISO). Требование 6 кейса допускает дату публикации ИЛИ получения. */
+  retrievedAt: string;
   category: Category;
   trust: TrustTier;
   evidence: Evidence;

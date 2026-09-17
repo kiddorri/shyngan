@@ -16,7 +16,7 @@ export const BATCH_SIZE = 4;
 const CONCURRENCY = 5;
 const REQUEST_TIMEOUT_MS = 30000;
 
-const CATEGORY_ENUM = ["campus", "dorm", "library", "lab", "sport", "life", "city", "other"] as const;
+const CATEGORY_ENUM = ["campus", "lecture", "dorm", "library", "lab", "sport", "life", "city", "other"] as const;
 const CONFIDENCE_ENUM = ["high", "medium", "low"] as const;
 
 function apiKey(): string {
@@ -45,7 +45,7 @@ function buildPrompt(ctx: VisionContext, count: number): string {
     `For EACH image return one entry with:`,
     `- index: the image number (1-based, in the order given).`,
     `- relevant: true if the image plausibly shows a university facility (building, campus grounds, dormitory, library, laboratory, sports facility, lecture hall), campus student life (events, students on campus), or the public surroundings near a campus (park, square, cafe, street). false for logos, documents, screenshots, text-only graphics, food close-ups, selfies without campus context, unrelated interiors, promotional collages, maps.`,
-    `- category: exactly one of campus, dorm, library, lab, sport, life, city, other. Use "city" for the public surroundings a student would walk in — parks, squares, cafes, streets near campus — that are not university facilities themselves. Use "other" when relevant is false.`,
+    `- category: exactly one of campus, lecture, dorm, library, lab, sport, life, city, other. Use "lecture" for classrooms, lecture halls and auditoriums — rooms with seating rows, desks, a board or a screen. Use "city" for the public surroundings a student would walk in — parks, squares, cafes, streets near campus — that are not university facilities themselves. Use "other" when relevant is false.`,
     `- caption: up to 8 words in Russian, a factual description of what is visible. No guesses about which university it is.`,
     `- confidence: high, medium or low — how sure you are about relevant and category.`,
     ``,

@@ -33,10 +33,23 @@ const TRUST_COLORS: Record<TrustTier, string> = {
 
 type SourceFilter = "all" | PhotoSource;
 
+const ANCHOR_LABELS: Record<string, string> = {
+  wikidata: "Wikidata",
+  places: "Google Places (без подтверждения)",
+  "places+2gis": "Google Places, подтверждено 2ГИС",
+  none: "не найдены",
+};
+
+/** Дата получения снимка: требование 6 кейса допускает дату публикации ИЛИ получения. */
+function formatRetrieved(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleDateString("ru-RU");
+}
+
 function progressText(e: ProgressEvent): string {
   switch (e.stage) {
     case "anchor":
-      return e.source === "none" ? "Координаты кампуса не найдены" : `Якорь координат: ${e.source}`;
+      return e.source === "none" ? "Координаты кампуса не найдены" : `Якорь координат: ${ANCHOR_LABELS[e.source] ?? e.source}`;
     case "places":
       return `Google Places: ${e.found} снимков`;
     case "official":
@@ -64,6 +77,7 @@ function badgeText(p: PhotoItem): string {
   const content = p.evidence.vision ? "" : " · содержимое не проверено";
   return base + dist + content;
 }
+
 
 export default function Home() {
   const [query, setQuery] = useState("");
@@ -182,7 +196,7 @@ export default function Home() {
 
       {loading === "profile" && (
         <div style={{ marginBottom: 16, fontSize: 14, color: "#555" }}>
-          <div>Собираю профиль… обычно 15–25 секунд: поиск мест, загрузка снимков, проверка содержимого.</div>
+          <div>Собираю профиль… обычно 10–20 секунд: поиск мест, загрузка снимков, проверка содержимого.</div>
           <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
             {progress.map((line, i) => <li key={i}>{line}</li>)}
           </ul>
@@ -306,7 +320,7 @@ export default function Home() {
                       </>
                     )}
                   </div>
-                  <div style={{ color: "#777" }}>дата публикации: неизвестна</div>
+                  <div style={{ color: "#777" }}>дата публикации неизвестна · получено {formatRetrieved(p.retrievedAt)}</div>
                 </figcaption>
               </figure>
             ))}

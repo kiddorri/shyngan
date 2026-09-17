@@ -68,6 +68,7 @@ type QueryPlanItem = {
 
 const QUERY_PLAN: QueryPlanItem[] = [
   { category: "campus", build: (u) => u.label, pageSize: 1 },
+  { category: "lecture", build: (u) => `${u.label} учебный корпус`, pageSize: 2 },
   { category: "dorm", build: (u) => `${u.label} общежитие`, pageSize: 2 },
   { category: "library", build: (u) => `${u.label} библиотека`, pageSize: 2 },
   { category: "lab", build: (u) => `${u.label} лаборатория`, pageSize: 2 },
@@ -99,7 +100,7 @@ const TIER_RANK: Record<TrustTier, number> = { verified: 0, probable: 1, unverif
 const SOURCE_RANK: Record<PhotoSource, number> = { official_site: 0, google_places: 1 };
 /** Порядок вывода: объекты вуза впереди, город последним. */
 const CATEGORY_RANK: Record<Category, number> = {
-  campus: 0, dorm: 1, library: 2, lab: 3, sport: 4, life: 5, city: 6,
+  campus: 0, lecture: 1, dorm: 2, library: 3, lab: 4, sport: 5, life: 6, city: 7,
 };
 
 // ---- Доверие по расстоянию ----
@@ -461,6 +462,7 @@ export async function buildProfile(
       sourceUrl: raw.sourceUrl,
       attribution: raw.attribution,
       publishedAt: null,
+      retrievedAt: new Date().toISOString(),
       category,
       trust,
       evidence: { ...raw.evidence, vision: v, reasons },
