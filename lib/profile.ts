@@ -407,7 +407,7 @@ export async function buildProfile(
   }
   onProgress({ stage: "dedupe", kept: kept.length, duplicates: removed.duplicates });
 
-  // 6. Vision: что изображено. Батчи по 8, ошибки не роняют профиль.
+  // 6. Vision: что изображено. Батчи по BATCH_SIZE, ошибки не роняют профиль.
   const visionInputs: VisionInput[] = kept.map((k) => ({ id: k.raw.id, bytes: k.img.bytes, mime: k.img.mime }));
   onProgress({ stage: "vision", batches: Math.ceil(visionInputs.length / BATCH_SIZE) });
   let verdicts = new Map<string, VisionVerdict>();
