@@ -15,7 +15,7 @@ import { dHash, hamming, loadImage, type LoadedImage } from "./image";
 import { collectOfficialImages } from "./official";
 import { getPhotoUri, searchText, type Place } from "./places";
 import { findInTwoGis } from "./twogis";
-import { classifyImages, type VisionInput } from "./vision";
+import { BATCH_SIZE, classifyImages, type VisionInput } from "./vision";
 import {
   ALL_CATEGORIES,
   type Anchor,
@@ -42,8 +42,9 @@ const NEIGHBORHOOD_BIAS_RADIUS_M = 2000;
 /** Точки Places и 2ГИС ближе этого порога считаются одним и тем же местом. */
 const CORROBORATION_RADIUS_M = 500;
 
-const PHOTOS_PER_PLACE = 5;
-const MAX_PLACES_PHOTOS = 40;
+/** Кейс прямо говорит: пятнадцать проверенных снимков ценнее сотни случайных. */
+const PHOTOS_PER_PLACE = 3;
+const MAX_PLACES_PHOTOS = 30;
 const MAX_OFFICIAL_PHOTOS = 10;
 /** Окружение — контекст, а не кампус: держим его небольшим, чтобы оно не забивало профиль. */
 const MAX_CITY_PHOTOS = 3;
@@ -134,6 +135,7 @@ function assessTrust(
   }
 
   const distanceM = haversineM(anchor.lat, anchor.lon, place.location.latitude, place.location.longitude);
+  reasons.push("Расстояние измеряется до отметки места на карте, а не до точки, где сделан снимок");
 
   let trust: TrustTier;
   if (distanceM <= VERIFIED_RADIUS_M) {
@@ -407,7 +409,7 @@ export async function buildProfile(
 
   // 6. Vision: что изображено. Батчи по 8, ошибки не роняют профиль.
   const visionInputs: VisionInput[] = kept.map((k) => ({ id: k.raw.id, bytes: k.img.bytes, mime: k.img.mime }));
-  onProgress({ stage: "vision", batches: Math.ceil(visionInputs.length / 8) });
+  onProgress({ stage: "vision", batches: Math.ceil(visionInputs.length / BATCH_SIZE) });
   let verdicts = new Map<string, VisionVerdict>();
   let visionErrors: string[] = [];
   if (process.env.GEMINI_API_KEY) {
@@ -469,7 +471,12 @@ export async function buildProfile(
   }
 
   // 8. Окружение ограничиваем и ставим в конец: это контекст, а не объекты вуза.
-  const cityPhotos = photos.filter((p) => p.category === "city").slice(0, MAX_CITY_PHOTOS);
+  // Из снимков окружения оставляем в первую очередь те, что пришли из запросов
+  // про окружение: они действительно про район, а не переразмечены из места вуза.
+  const cityPhotos = photos
+    .filter((p) => p.category === "city")
+    .sort((a, b) => Number(b.evidence.queryIntent === "city") - Number(a.evidence.queryIntent === "city"))
+    .slice(0, MAX_CITY_PHOTOS);
   const rest = photos.filter((p) => p.category !== "city");
   const ordered = [...rest, ...cityPhotos].sort(
     (a, b) => CATEGORY_RANK[a.category] - CATEGORY_RANK[b.category] || TIER_RANK[a.trust] - TIER_RANK[b.trust],

@@ -10,9 +10,10 @@ import type { Category, VisionVerdict } from "./types";
 
 const GEMINI_MODEL = "gemini-3.8-flash";
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-const BATCH_SIZE = 4;
-/** Сколько батчей отправляем одновременно. Держим низко, чтобы не упереться в RPM. */
-const CONCURRENCY = 3;
+/** Экспортируется, чтобы прогресс показывал настоящее число запросов к модели. */
+export const BATCH_SIZE = 4;
+/** Сколько батчей отправляем одновременно. Пять укладывается в лимиты платного тира. */
+const CONCURRENCY = 5;
 const REQUEST_TIMEOUT_MS = 30000;
 
 const CATEGORY_ENUM = ["campus", "dorm", "library", "lab", "sport", "life", "city", "other"] as const;
