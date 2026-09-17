@@ -4,7 +4,8 @@
 // или {"type":"error","error":"..."}.
 
 import { buildProfile } from "@/lib/profile";
-import { getUniversityByQid, WikidataUnavailableError } from "@/lib/wikidata";
+import { getUniversityByAnyId } from "@/lib/resolve";
+import { WikidataUnavailableError } from "@/lib/wikidata";
 import type { ProgressEvent } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -21,13 +22,14 @@ const NDJSON_HEADERS = {
 export async function GET(req: Request): Promise<Response> {
   const qid = new URL(req.url).searchParams.get("qid") ?? "";
 
-  if (!/^Q\d+$/.test(qid)) {
-    return Response.json({ error: "Параметр qid должен иметь вид Q12345" }, { status: 400 });
+  // Идентификатор вуза: QID из Wikidata либо places:<place_id> для вузов вне Wikidata.
+  if (!/^Q\d+$/.test(qid) && !/^places:[\w-]+$/.test(qid)) {
+    return Response.json({ error: "Параметр qid должен иметь вид Q12345 или places:<id>" }, { status: 400 });
   }
 
   let university;
   try {
-    university = await getUniversityByQid(qid);
+    university = await getUniversityByAnyId(qid);
   } catch (e) {
     const unavailable = e instanceof WikidataUnavailableError;
     return Response.json(
@@ -40,7 +42,7 @@ export async function GET(req: Request): Promise<Response> {
     );
   }
   if (!university) {
-    return Response.json({ error: `Университет ${qid} не найден в Wikidata или не является вузом` }, { status: 404 });
+    return Response.json({ error: `Университет ${qid} не найден или не является вузом` }, { status: 404 });
   }
 
   const encoder = new TextEncoder();

@@ -1,23 +1,29 @@
 // lib/places.ts
-// Тонкий клиент Google Places API (New). Только два вызова:
-//   1) searchText  — POST https://places.googleapis.com/v1/places:searchText
-//   2) getPhotoUri — GET  https://places.googleapis.com/v1/{photo.name}/media?skipHttpRedirect=true
+// Тонкий клиент Google Places API (New). Только три вызова:
+//   1) searchText       — POST https://places.googleapis.com/v1/places:searchText
+//   2) getPlaceDetails  — GET  https://places.googleapis.com/v1/places/{place_id}
+//   3) getPhotoUri      — GET  https://places.googleapis.com/v1/{photo.name}/media?skipHttpRedirect=true
 // Ничего другого из Places не используется.
 
 const PLACES_BASE = "https://places.googleapis.com/v1";
 const REQUEST_TIMEOUT_MS = 8000;
 
+/** Поля, которые нам нужны от места. Общий список для поиска и для карточки места. */
+const PLACE_FIELDS = [
+  "id",
+  "displayName",
+  "formattedAddress",
+  "location",
+  "photos",
+  "googleMapsUri",
+  "websiteUri",
+];
+
 // Field mask обязателен: без него API возвращает ошибку.
-// Перечисленные поля — единственные, которые нужны блоку A.
-const TEXT_SEARCH_FIELD_MASK = [
-  "places.id",
-  "places.displayName",
-  "places.formattedAddress",
-  "places.location",
-  "places.photos",
-  "places.googleMapsUri",
-  "places.websiteUri",
-].join(",");
+// В ответе searchText места лежат в массиве places, поэтому здесь поля с префиксом.
+const TEXT_SEARCH_FIELD_MASK = PLACE_FIELDS.map((f) => `places.${f}`).join(",");
+// Place Details отдаёт объект Place на верхнем уровне — здесь поля без префикса.
+const PLACE_DETAILS_FIELD_MASK = PLACE_FIELDS.join(",");
 
 function apiKey(): string {
   const key = process.env.GOOGLE_PLACES_API_KEY;
@@ -91,6 +97,45 @@ export async function searchText(
 
   const json = (await res.json()) as { places?: Place[] };
   return json.places ?? [];
+}
+
+/**
+ * Место по его place_id — штатный эндпоинт Place Details (New).
+ * Текстовый поиск по place_id не работает: он возвращает пустой список.
+ *
+ * null — места с таким идентификатором не существует. Places говорит это двумя
+ * способами: 404 NOT_FOUND для идентификатора, которого уже нет, и 400
+ * INVALID_ARGUMENT для строки, которая идентификатором быть не может. Для нас
+ * это один ответ: такого вуза нет.
+ *
+ * Любая другая ошибка пробрасывается: «не нашли» и «не смогли спросить» —
+ * разные ответы, и путать их нельзя.
+ */
+export async function getPlaceDetails(placeId: string): Promise<Place | null> {
+  const url = `${PLACES_BASE}/places/${encodeURIComponent(placeId)}?languageCode=ru`;
+
+  const res = await fetch(url, {
+    headers: {
+      "X-Goog-Api-Key": apiKey(),
+      "X-Goog-FieldMask": PLACE_DETAILS_FIELD_MASK,
+    },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    let status: string | undefined;
+    try {
+      status = (JSON.parse(text) as { error?: { status?: string } }).error?.status;
+    } catch {
+      /* тело не JSON — считаем это сбоем, а не ответом «нет такого места» */
+    }
+    if (res.status === 404 || status === "NOT_FOUND" || status === "INVALID_ARGUMENT") return null;
+    throw new Error(`Places details HTTP ${res.status}: ${text.slice(0, 300)}`);
+  }
+
+  // Ответ — сам объект Place, без обёртки.
+  return (await res.json()) as Place;
 }
 
 /**

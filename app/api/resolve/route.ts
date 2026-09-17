@@ -1,7 +1,8 @@
 // app/api/resolve/route.ts
 // GET /api/resolve?q=<название> → { candidates: UniversityCandidate[] }
 
-import { resolveUniversity, WikidataUnavailableError } from "@/lib/wikidata";
+import { resolveAny } from "@/lib/resolve";
+import { WikidataUnavailableError } from "@/lib/wikidata";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -17,7 +18,7 @@ export async function GET(req: Request): Promise<Response> {
   }
 
   try {
-    const candidates = await resolveUniversity(q);
+    const candidates = await resolveAny(q);
     return Response.json({ candidates });
   } catch (e) {
     const unavailable = e instanceof WikidataUnavailableError;

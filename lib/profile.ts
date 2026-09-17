@@ -210,6 +210,27 @@ async function placeToRaw(
   return out;
 }
 
+/** «farabi.university/gallery» — видно, с какой именно страницы сайта взят снимок. */
+function pagePathOf(pageUrl: string, host: string | null): string {
+  try {
+    const u = new URL(pageUrl);
+    const path = u.pathname === "/" ? " (главная)" : u.pathname;
+    return `${u.hostname.replace(/^www\./, "")}${path}`;
+  } catch {
+    return host ?? pageUrl;
+  }
+}
+
+/** «/gallery» — короткое имя прочитанной страницы для предупреждений. */
+function shortPath(pageUrl: string): string {
+  try {
+    const u = new URL(pageUrl);
+    return u.pathname === "/" ? "главная" : decodeURIComponent(u.pathname);
+  } catch {
+    return pageUrl;
+  }
+}
+
 // ---- Покрытие ----
 
 function computeCoverage(photos: PhotoItem[]): CategoryCoverage[] {
@@ -232,6 +253,13 @@ export async function buildProfile(
 ): Promise<Profile> {
   const started = Date.now();
   const warnings: string[] = [];
+  if (university.resolvedVia === "places") {
+    warnings.push(
+      // Про координаты здесь говорить нельзя: расположение проверяется ниже, и 2ГИС
+      // вполне может его подтвердить. Эта строка — только про карточку вуза.
+      "Этого вуза нет в Wikidata: название и официальный сайт взяты из Google Places — того же источника, что и часть фотографий, поэтому независимого подтверждения у них нет. Координат Wikidata у такого вуза тоже нет, расположение проверяется отдельно.",
+    );
+  }
   if (university.resolvedVia === "action-api") {
     warnings.push(
       "Справочник SPARQL не ответил — карточка вуза получена запасным путём (Wikidata Action API). Там недоступна проверка по цепочке подклассов, поэтому отбор «это вуз» мягче обычного.",
@@ -306,7 +334,7 @@ export async function buildProfile(
     ),
     university.officialWebsite
       ? collectOfficialImages(university.officialWebsite, USER_AGENT)
-      : Promise.resolve({ candidates: [], error: "в Wikidata не указан официальный сайт (P856)" }),
+      : Promise.resolve({ candidates: [], pagesVisited: [] as string[], error: "официальный сайт вуза неизвестен" }),
   ]);
 
   // Одно место — одна категория. Первое вхождение побеждает (campus идёт первым).
@@ -329,7 +357,15 @@ export async function buildProfile(
     .slice(0, MAX_PLACES_PHOTOS);
   onProgress({ stage: "places", found: placesRaw.length });
 
+
   if (official.error) warnings.push(`Официальный сайт: ${official.error}`);
+  else if (official.pagesVisited.length > 1) {
+    // Перечисляем реально прочитанные адреса. Раньше здесь стояло «главная и разделы
+    // с фотографиями» — утверждение о содержимом страниц, которое мы не проверяли:
+    // внутренние ссылки отбираются по тексту, и иногда это не галерея.
+    const paths = official.pagesVisited.map(shortPath).join(", ");
+    warnings.push(`Официальный сайт: прочитано страниц — ${official.pagesVisited.length} (${paths})`);
+  }
   let officialHost: string | null = null;
   try {
     officialHost = university.officialWebsite ? new URL(university.officialWebsite).hostname.replace(/^www\./, "") : null;
@@ -353,7 +389,10 @@ export async function buildProfile(
       queryIntent: null,
       vision: null,
       reasons: [
-        `Опубликовано на главной странице официального сайта ${officialHost ?? ""} (домен указан в Wikidata, P856)`,
+        `Опубликовано на официальном сайте вуза: ${pagePathOf(c.pageUrl, officialHost)}`,
+        university.resolvedVia === "places"
+          ? "Адрес сайта взят из карточки места в Google Places"
+          : "Адрес сайта взят из Wikidata (свойство P856)",
         "Географическая проверка не применяется: провенанс доказан доменом, а не координатами",
       ],
     },
