@@ -66,6 +66,8 @@ export type Evidence = {
   /** null для снимков с официального сайта — они не привязаны к месту в Places. */
   placeId: string | null;
   placeName: string;
+  /** Человекочитаемый адрес места. null для снимков с сайта вуза. */
+  address: string | null;
   distanceM: number | null;
   /** Какой поисковый запрос нашёл место. null для официального сайта. */
   queryIntent: Category | null;

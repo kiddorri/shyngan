@@ -12,6 +12,7 @@ const REQUEST_TIMEOUT_MS = 8000;
 const TEXT_SEARCH_FIELD_MASK = [
   "places.id",
   "places.displayName",
+  "places.formattedAddress",
   "places.location",
   "places.photos",
   "places.googleMapsUri",
@@ -39,6 +40,7 @@ export type PlacePhoto = {
 export type Place = {
   id: string;
   displayName?: { text: string; languageCode?: string };
+  formattedAddress?: string;
   location?: { latitude: number; longitude: number };
   photos?: PlacePhoto[];
   googleMapsUri?: string;
