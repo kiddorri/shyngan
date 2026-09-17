@@ -20,7 +20,7 @@ export const CATEGORY_LABELS: Record<Category, string> = {
   lab: "Лаборатории",
   sport: "Спорт",
   life: "Студенческая жизнь",
-  city: "Город",
+  city: "Вокруг кампуса",
 };
 
 export const ALL_CATEGORIES: Category[] = ["campus", "dorm", "library", "lab", "sport", "life", "city"];

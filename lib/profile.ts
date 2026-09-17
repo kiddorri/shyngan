@@ -36,15 +36,16 @@ import {
 
 const VERIFIED_RADIUS_M = 1500;
 const PROBABLE_RADIUS_M = 6000;
-const CITY_RADIUS_M = 30000;
 const SEARCH_BIAS_RADIUS_M = 5000;
+/** Радиус поиска общественных мест вокруг кампуса: парки и кафе, до которых студент дойдёт пешком. */
+const NEIGHBORHOOD_BIAS_RADIUS_M = 2000;
 /** Точки Places и 2ГИС ближе этого порога считаются одним и тем же местом. */
 const CORROBORATION_RADIUS_M = 500;
 
 const PHOTOS_PER_PLACE = 5;
 const MAX_PLACES_PHOTOS = 40;
 const MAX_OFFICIAL_PHOTOS = 10;
-/** Город — контекст, а не кампус: держим его небольшим, чтобы он не забивал профиль. */
+/** Окружение — контекст, а не кампус: держим его небольшим, чтобы оно не забивало профиль. */
 const MAX_CITY_PHOTOS = 3;
 const MIN_WIDTH_PX = 500;
 const MIN_HEIGHT_PX = 300;
@@ -60,6 +61,8 @@ type QueryPlanItem = {
   category: Category;
   build: (u: UniversityCandidate) => string | null;
   pageSize: number;
+  /** Радиус locationBias. По умолчанию SEARCH_BIAS_RADIUS_M. */
+  biasRadiusM?: number;
 };
 
 const QUERY_PLAN: QueryPlanItem[] = [
@@ -68,7 +71,10 @@ const QUERY_PLAN: QueryPlanItem[] = [
   { category: "library", build: (u) => `${u.label} библиотека`, pageSize: 2 },
   { category: "lab", build: (u) => `${u.label} лаборатория`, pageSize: 2 },
   { category: "sport", build: (u) => `${u.label} спортивный комплекс`, pageSize: 2 },
-  { category: "city", build: (u) => u.city, pageSize: 1 },
+  // Окружение кампуса ищем рядом с якорем, а не по названию города: студенту
+  // полезен парк в десяти минутах ходьбы, а не панорама центра в восьми километрах.
+  { category: "city", build: () => "парк", pageSize: 1, biasRadiusM: NEIGHBORHOOD_BIAS_RADIUS_M },
+  { category: "city", build: () => "кафе", pageSize: 1, biasRadiusM: NEIGHBORHOOD_BIAS_RADIUS_M },
 ];
 
 // ---- Промежуточное представление снимка до загрузки ----
@@ -103,7 +109,6 @@ function downgrade(t: TrustTier): TrustTier {
 
 function assessTrust(
   place: Place,
-  category: Category,
   anchor: Anchor | null,
   anchorPlaceId: string | null,
 ): { trust: TrustTier; distanceM: number | null; reasons: string[] } {
@@ -131,10 +136,7 @@ function assessTrust(
   const distanceM = haversineM(anchor.lat, anchor.lon, place.location.latitude, place.location.longitude);
 
   let trust: TrustTier;
-  if (category === "city") {
-    trust = distanceM <= CITY_RADIUS_M ? "verified" : "unverified";
-    reasons.push(`Расстояние до кампуса ${distanceM} м (порог для города ${CITY_RADIUS_M} м)`);
-  } else if (distanceM <= VERIFIED_RADIUS_M) {
+  if (distanceM <= VERIFIED_RADIUS_M) {
     trust = "verified";
     reasons.push(`Расстояние до кампуса ${distanceM} м (порог ${VERIFIED_RADIUS_M} м)`);
   } else if (distanceM <= PROBABLE_RADIUS_M) {
@@ -172,7 +174,7 @@ async function placeToRaw(
   const photos = (place.photos ?? []).slice(0, PHOTOS_PER_PLACE);
   if (photos.length === 0) return [];
 
-  const { trust, distanceM, reasons } = assessTrust(place, category, anchor, anchorPlaceId);
+  const { trust, distanceM, reasons } = assessTrust(place, anchor, anchorPlaceId);
   const placeName = place.displayName?.text ?? place.id;
   const uris = await Promise.all(photos.map((p) => getPhotoUri(p.name)));
 
@@ -284,12 +286,10 @@ export async function buildProfile(
     Promise.all(
       restPlan.map(async (item) => {
         const q = item.build(university);
-        if (!q) {
-          if (item.category === "city") warnings.push("В Wikidata нет города (P131) — запрос по городу пропущен");
-          return { category: item.category, places: [] as Place[] };
-        }
+        if (!q) return { category: item.category, places: [] as Place[] };
+        const itemBias = bias && item.biasRadiusM ? { ...bias, radiusM: item.biasRadiusM } : bias;
         try {
-          return { category: item.category, places: await searchText(q, { bias, pageSize: item.pageSize }) };
+          return { category: item.category, places: await searchText(q, { bias: itemBias, pageSize: item.pageSize }) };
         } catch (e) {
           warnings.push(`Places: запрос «${q}» не выполнен (${(e as Error).message})`);
           return { category: item.category, places: [] as Place[] };
@@ -463,7 +463,7 @@ export async function buildProfile(
     });
   }
 
-  // 8. Город ограничиваем и ставим в конец: это контекст, а не объекты вуза.
+  // 8. Окружение ограничиваем и ставим в конец: это контекст, а не объекты вуза.
   const cityPhotos = photos.filter((p) => p.category === "city").slice(0, MAX_CITY_PHOTOS);
   const rest = photos.filter((p) => p.category !== "city");
   const ordered = [...rest, ...cityPhotos].sort(
