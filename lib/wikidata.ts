@@ -3,6 +3,7 @@
 // Ключ не нужен. Нужен только описательный User-Agent (политика Wikimedia).
 
 import type { UniversityCandidate } from "./types";
+import { getUniversityByQidViaApi, resolveUniversityViaApi } from "./wikidata-api";
 
 const SPARQL_ENDPOINT = "https://query.wikidata.org/sparql";
 
@@ -10,6 +11,11 @@ const SPARQL_ENDPOINT = "https://query.wikidata.org/sparql";
 const USER_AGENT = "shyngan/0.1 (https://github.com/kiddorri/shyngan)";
 
 const REQUEST_TIMEOUT_MS = 8000;
+/** SPARQL-сервис отдаёт 429 при нескольких запросах подряд — жюри вводит вузы именно так. */
+const SPARQL_RETRY_DELAY_MS = 1200;
+
+/** Сервис не ответил (429, 5xx, таймаут). Отличается от «вуз не найден». */
+export class WikidataUnavailableError extends Error {}
 
 // Q38723 = "higher education institution" — родительский класс для
 // university / institute / academy. Фильтр wdt:P31/wdt:P279* означает:
@@ -24,7 +30,7 @@ const FIELDS_FRAGMENT = `
   OPTIONAL { ?item wdt:P17 ?country. }
   OPTIONAL { ?item wdt:P131 ?city. }
   OPTIONAL { ?item wdt:P18 ?image. }
-  OPTIONAL { ?item wdt:P31 ?instance. ?instance wdt:P279* wd:Q38723. }
+  OPTIONAL { ?item wdt:P31 ?instance. }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "ru,kk,en". }
 `;
 
@@ -74,17 +80,26 @@ type Binding = Record<string, { value: string } | undefined>;
 async function runSparql(query: string): Promise<UniversityCandidate[]> {
   const url = `${SPARQL_ENDPOINT}?query=${encodeURIComponent(query)}&format=json`;
 
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Accept: "application/sparql-results+json",
-    },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Wikidata SPARQL HTTP ${res.status}`);
+  let res: Response | null = null;
+  // Одна повторная попытка: троттлинг и пятисотки у SPARQL-сервиса обычно кратковременны.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      res = await fetch(url, {
+        headers: { "User-Agent": USER_AGENT, Accept: "application/sparql-results+json" },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (e) {
+      if (attempt === 1) throw new WikidataUnavailableError(`SPARQL недоступен: ${(e as Error).name}`);
+      await new Promise((r) => setTimeout(r, SPARQL_RETRY_DELAY_MS));
+      continue;
+    }
+    if (res.ok) break;
+    if (attempt === 1 || (res.status !== 429 && res.status < 500)) {
+      throw new WikidataUnavailableError(`SPARQL HTTP ${res.status}`);
+    }
+    await new Promise((r) => setTimeout(r, SPARQL_RETRY_DELAY_MS));
   }
+  if (!res || !res.ok) throw new WikidataUnavailableError("SPARQL не ответил");
 
   const json = (await res.json()) as { results?: { bindings?: Binding[] } };
   const bindings = json.results?.bindings ?? [];
@@ -102,6 +117,7 @@ async function runSparql(query: string): Promise<UniversityCandidate[]> {
 
     byQid.set(qid, {
       qid,
+      resolvedVia: "sparql",
       label: b.itemLabel?.value ?? prev?.label ?? qid,
       lat: lat ?? prev?.lat ?? null,
       lon: lon ?? prev?.lon ?? null,
@@ -125,21 +141,40 @@ export async function resolveUniversity(search: string): Promise<UniversityCandi
   const trimmed = search.trim();
   if (!trimmed) return [];
 
+  let sparqlFailed = false;
   for (const lang of ["ru", "en", "kk"] as const) {
     try {
       const candidates = await runSparql(buildSearchQuery(trimmed, lang));
       if (candidates.length > 0) return candidates;
     } catch (e) {
-      console.error(`resolveUniversity: lang=${lang} failed`, e);
+      sparqlFailed = true;
+      console.error(`resolveUniversity: SPARQL lang=${lang} failed`, e);
+      break; // сервис лежит — перебирать языки бессмысленно, сразу к запасному пути
     }
   }
 
-  return [];
+  // SPARQL вернул пустой результат по всем языкам — вуза действительно нет.
+  if (!sparqlFailed) return [];
+
+  // Сервис не ответил: пробуем Action API — те же данные, другие лимиты.
+  try {
+    return await resolveUniversityViaApi(trimmed, USER_AGENT);
+  } catch (e) {
+    throw new WikidataUnavailableError(
+      `Wikidata не отвечает: SPARQL и Action API недоступны (${(e as Error).message})`,
+    );
+  }
 }
 
 /** QID → одна карточка (для /api/profile после выбора кандидата в UI). */
 export async function getUniversityByQid(qid: string): Promise<UniversityCandidate | null> {
   if (!/^Q\d+$/.test(qid)) return null;
-  const rows = await runSparql(buildByQidQuery(qid));
-  return rows[0] ?? null;
+  try {
+    const rows = await runSparql(buildByQidQuery(qid));
+    if (rows[0]) return rows[0];
+  } catch (e) {
+    console.error("getUniversityByQid: SPARQL failed, trying Action API", e);
+    return getUniversityByQidViaApi(qid, USER_AGENT);
+  }
+  return null;
 }

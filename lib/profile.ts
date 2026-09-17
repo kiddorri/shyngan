@@ -229,6 +229,11 @@ export async function buildProfile(
 ): Promise<Profile> {
   const started = Date.now();
   const warnings: string[] = [];
+  if (university.resolvedVia === "action-api") {
+    warnings.push(
+      "Справочник SPARQL не ответил — карточка вуза получена запасным путём (Wikidata Action API). Там недоступна проверка по цепочке подклассов, поэтому отбор «это вуз» мягче обычного.",
+    );
+  }
   const removed: RemovalStats = { duplicates: 0, irrelevant: 0, tooSmall: 0, failedDownload: 0 };
 
   // 1. Главный запрос к Places — от него может зависеть якорь.

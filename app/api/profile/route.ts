@@ -4,11 +4,13 @@
 // или {"type":"error","error":"..."}.
 
 import { buildProfile } from "@/lib/profile";
-import { getUniversityByQid } from "@/lib/wikidata";
+import { getUniversityByQid, WikidataUnavailableError } from "@/lib/wikidata";
 import type { ProgressEvent } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+/** Hobby-план Vercel допускает до 300 с. Потолок с запасом: обычная сборка укладывается в 30 с,
+ *  но у вуза с большим числом мест лучше отдать медленный ответ, чем оборвать поток. */
+export const maxDuration = 180;
 
 const NDJSON_HEADERS = {
   "Content-Type": "application/x-ndjson; charset=utf-8",
@@ -27,7 +29,15 @@ export async function GET(req: Request): Promise<Response> {
   try {
     university = await getUniversityByQid(qid);
   } catch (e) {
-    return Response.json({ error: `Wikidata недоступна: ${(e as Error).message}` }, { status: 502 });
+    const unavailable = e instanceof WikidataUnavailableError;
+    return Response.json(
+      {
+        error: unavailable
+          ? "Справочник Wikidata временно не отвечает. Повторите через несколько секунд."
+          : `Ошибка резолва: ${(e as Error).message}`,
+      },
+      { status: unavailable ? 503 : 502 },
+    );
   }
   if (!university) {
     return Response.json({ error: `Университет ${qid} не найден в Wikidata или не является вузом` }, { status: 404 });

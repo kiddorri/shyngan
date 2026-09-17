@@ -36,8 +36,13 @@ export const SOURCE_LABELS: Record<PhotoSource, string> = {
 /** Откуда взяты координаты, относительно которых считалось расстояние. */
 export type AnchorSource = "wikidata" | "places" | "places+2gis" | "none";
 
+/** Каким путём получена карточка. action-api — запасной режим при отказе SPARQL: там нет
+ *  обхода подклассов, поэтому фильтр «это вуз» мягче, и об этом надо сказать пользователю. */
+export type ResolvedVia = "sparql" | "action-api";
+
 export type UniversityCandidate = {
   qid: string;
+  resolvedVia: ResolvedVia;
   label: string;
   lat: number | null;
   lon: number | null;
