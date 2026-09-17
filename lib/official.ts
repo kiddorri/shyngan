@@ -102,8 +102,16 @@ export async function collectOfficialImages(
     // Если после редиректов адрес сменился — относительные ссылки считаем от него.
     pageUrl = res.url || pageUrl;
   } catch (e) {
-    const msg = (e as Error).name === "TimeoutError" ? "таймаут загрузки" : (e as Error).message;
-    return { candidates: [], error: `сайт недоступен: ${msg}` };
+    const err = e as Error & { cause?: { code?: string } };
+    const code = err.cause?.code;
+    let reason: string;
+    if (err.name === "TimeoutError") reason = "таймаут загрузки";
+    else if (code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" || code === "CERT_HAS_EXPIRED" || code === "DEPTH_ZERO_SELF_SIGNED_CERT" || code === "SELF_SIGNED_CERT_IN_CHAIN") reason = `сертификат сайта не проходит проверку (${code})`;
+    else if (code === "ENOTFOUND") reason = "домен не найден";
+    else if (code === "ECONNREFUSED") reason = "соединение отклонено";
+    else if (code === "ECONNRESET") reason = "соединение разорвано";
+    else reason = code ?? err.message;
+    return { candidates: [], error: `сайт недоступен: ${reason}` };
   }
 
   const urls = extractImageUrls(html, pageUrl);
