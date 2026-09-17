@@ -1,0 +1,93 @@
+// lib/image.ts
+// Загрузка картинки по URL, нормализация под vision и перцептивный хэш (dHash).
+// Только серверный код: sharp нельзя импортировать из клиентских компонентов.
+
+import sharp from "sharp";
+
+const MAX_BYTES = 8_000_000;
+const REQUEST_TIMEOUT_MS = 8000;
+/** Ширина, до которой ужимаем копию для vision и хэша. Оригинальные размеры сохраняем отдельно. */
+const NORMALIZED_WIDTH = 1024;
+
+export type LoadedImage = {
+  url: string;
+  /** JPEG ≤ 1024 px по ширине — то, что уходит в vision. */
+  bytes: Buffer;
+  mime: "image/jpeg";
+  /** Размеры оригинала. */
+  width: number;
+  height: number;
+};
+
+/**
+ * Скачивает картинку и приводит к JPEG ≤ 1024 px. Возвращает null при любой ошибке:
+ * таймаут, не-изображение, слишком большой файл, нечитаемый формат.
+ */
+export async function loadImage(url: string, userAgent: string): Promise<LoadedImage | null> {
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": userAgent, Accept: "image/*" },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      redirect: "follow",
+    });
+    if (!res.ok) return null;
+
+    const contentType = res.headers.get("content-type") ?? "";
+    if (contentType && !contentType.startsWith("image/")) return null;
+
+    const raw = Buffer.from(await res.arrayBuffer());
+    if (raw.length === 0 || raw.length > MAX_BYTES) return null;
+
+    const meta = await sharp(raw).metadata();
+    if (!meta.width || !meta.height) return null;
+    // SVG и анимации не нужны: это иконки и баннеры, а не фотографии.
+    if (meta.format === "svg" || meta.format === "gif") return null;
+
+    const bytes = await sharp(raw)
+      .rotate()
+      .resize({ width: NORMALIZED_WIDTH, withoutEnlargement: true })
+      .jpeg({ quality: 85 })
+      .toBuffer();
+
+    return { url, bytes, mime: "image/jpeg", width: meta.width, height: meta.height };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * dHash: картинка → 9×8 в градациях серого → 64 бита «пиксель ярче соседа справа».
+ * Устойчив к пережатию и изменению размера. Возвращает 16 hex-символов.
+ */
+export async function dHash(bytes: Buffer): Promise<string> {
+  const px = await sharp(bytes)
+    .grayscale()
+    .resize(9, 8, { fit: "fill" })
+    .raw()
+    .toBuffer();
+
+  let hex = "";
+  for (let y = 0; y < 8; y++) {
+    let byte = 0;
+    for (let x = 0; x < 8; x++) {
+      const left = px[y * 9 + x];
+      const right = px[y * 9 + x + 1];
+      byte = (byte << 1) | (left > right ? 1 : 0);
+    }
+    hex += byte.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+/** Число различающихся битов между двумя dHash. 0 — одинаковые, ≤10 — визуально похожие. */
+export function hamming(a: string, b: string): number {
+  let dist = 0;
+  for (let i = 0; i < 16; i += 2) {
+    let x = parseInt(a.slice(i, i + 2), 16) ^ parseInt(b.slice(i, i + 2), 16);
+    while (x) {
+      dist += x & 1;
+      x >>= 1;
+    }
+  }
+  return dist;
+}
