@@ -21,6 +21,10 @@ export class WikidataUnavailableError extends Error {}
 // university / institute / academy. Фильтр wdt:P31/wdt:P279* означает:
 // "тип элемента или любой его надкласс равен Q38723".
 const HIGHER_EDU_CLASS = "wd:Q38723";
+// Q3918 = "university" — более узкая ветка. У вуза бывает несколько значений P31,
+// и порядок строк в ответе SPARQL не определён, поэтому спрашиваем обе ветки
+// и предпочитаем узкую: иначе «Назарбаев Университет — местонахождение».
+const UNIVERSITY_CLASS = "wd:Q3918";
 
 // Общий набор полей. ?item должен быть связан до вставки этого фрагмента.
 const FIELDS_FRAGMENT = `
@@ -30,12 +34,13 @@ const FIELDS_FRAGMENT = `
   OPTIONAL { ?item wdt:P17 ?country. }
   OPTIONAL { ?item wdt:P131 ?city. }
   OPTIONAL { ?item wdt:P18 ?image. }
-  OPTIONAL { ?item wdt:P31 ?instance. }
+  OPTIONAL { ?item wdt:P31 ?instanceUni. ?instanceUni wdt:P279* ${UNIVERSITY_CLASS}. }
+  OPTIONAL { ?item wdt:P31 ?instance. ?instance wdt:P279* ${HIGHER_EDU_CLASS}. }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "ru,kk,en". }
 `;
 
 const SELECT_HEAD =
-  "SELECT ?item ?itemLabel ?coord ?website ?countryLabel ?cityLabel ?image ?instanceLabel WHERE {";
+  "SELECT ?item ?itemLabel ?coord ?website ?countryLabel ?cityLabel ?image ?instanceLabel ?instanceUniLabel WHERE {";
 
 function escapeLiteral(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -125,7 +130,8 @@ async function runSparql(query: string): Promise<UniversityCandidate[]> {
       country: b.countryLabel?.value ?? prev?.country ?? null,
       city: b.cityLabel?.value ?? prev?.city ?? null,
       image: b.image?.value ?? prev?.image ?? null,
-      instanceOf: b.instanceLabel?.value ?? prev?.instanceOf ?? null,
+      // Первое непустое значение, узкая ветка приоритетнее широкой.
+      instanceOf: prev?.instanceOf ?? b.instanceUniLabel?.value ?? b.instanceLabel?.value ?? null,
     });
   }
 
