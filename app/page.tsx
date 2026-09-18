@@ -44,6 +44,9 @@ const TRUST_CLASS: Record<TrustTier, string> = {
 };
 
 const ANCHOR_LABELS: Record<string, string> = {
+  "wikidata+places+2gis": "Wikidata + Google Places + 2ГИС",
+  "wikidata+places": "Wikidata + Google Places",
+  "wikidata+2gis": "Wikidata + 2ГИС",
   wikidata: "Wikidata",
   places: "Google Places (без подтверждения)",
   "places+2gis": "Google Places, подтверждено 2ГИС",
@@ -184,7 +187,9 @@ function PhotoCard({ photo, onOpen }: { photo: PhotoItem; onOpen: (p: PhotoItem)
         {photo.evidence.address && <span className={styles.dim}>{photo.evidence.address}</span>}
         <span className={styles.captionLinks}>
           {photo.sourceUrl ? (
-            <a className={styles.link} href={photo.sourceUrl} target="_blank" rel="noreferrer">Источник</a>
+            <a className={styles.link} href={photo.sourceUrl} target="_blank" rel="noreferrer">
+              {photo.source === "google_places" ? "Фото в Google Maps" : "Источник"}
+            </a>
           ) : (
             <span className={styles.dim}>источник недоступен</span>
           )}
@@ -201,6 +206,7 @@ function PhotoCard({ photo, onOpen }: { photo: PhotoItem; onOpen: (p: PhotoItem)
             </>
           )}
         </span>
+        {photo.source === "google_places" && <span className={styles.googleAttribution} translate="no">Google Maps</span>}
         <span className={styles.dim}>
           {photo.publishedAt
             ? `опубликовано ${formatRetrieved(photo.publishedAt)}`
@@ -332,11 +338,17 @@ function Reviews({ reviews, placeName }: { reviews: PlaceReview[]; placeName: st
       <p className={styles.sectionNote}>
         Отзывы о месте «{placeName ?? "кампус"}» из Google Places, с датой публикации. Кто их автор — студент,
         сотрудник или гость — платформа не сообщает, поэтому студенческими мы их не называем.
+        Из предоставленной сервисом выборки отзывы упорядочены по дате.
       </p>
+      <span className={styles.googleAttribution} translate="no">Google Maps</span>
       <ul className={styles.reviewList}>
         {reviews.map((r, i) => (
           <li key={i} className={styles.review}>
             <div className={styles.reviewHead}>
+              {r.authorPhotoUri && (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img className={styles.authorAvatar} src={r.authorPhotoUri} alt="" />
+              )}
               {r.authorUri ? (
                 <a className={styles.link} href={r.authorUri} target="_blank" rel="noreferrer">{r.author}</a>
               ) : (
@@ -349,8 +361,10 @@ function Reviews({ reviews, placeName }: { reviews: PlaceReview[]; placeName: st
                   {ageNote(r.publishedAt)}
                 </span>
               )}
+              {r.visitDate && <span className={styles.dim}>посещение {r.visitDate}</span>}
             </div>
             <p className={styles.reviewText}>{r.text}</p>
+            {r.sourceUrl && <a className={styles.link} href={r.sourceUrl} target="_blank" rel="noreferrer">Отзыв в Google Maps</a>}
           </li>
         ))}
       </ul>
@@ -462,7 +476,11 @@ export default function Home() {
       if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
       if (json.candidates.length === 0) {
         setError("Университет не найден. Попробуйте другое написание или название на английском.");
-      } else if (json.candidates.length === 1) {
+      } else if (json.candidates.length === 1 &&
+        !/^[A-Z]{2,5}$/.test(text.trim()) &&
+        json.candidates[0].resolvedVia !== "places" &&
+        (json.candidates[0].officialWebsite ||
+          (json.candidates[0].lat !== null && json.candidates[0].lon !== null))) {
         await loadProfile(json.candidates[0].qid);
       } else {
         setCandidates(json.candidates);
@@ -605,9 +623,10 @@ export default function Home() {
           </div>
         )}
 
-        {candidates.length > 1 && (
+        {candidates.length > 0 && (
           <section className={styles.candidates}>
-            <h2 className={styles.sectionTitle}>Уточните, какой университет</h2>
+            <h2 className={styles.sectionTitle}>Выберите университет</h2>
+            <p>При неоднозначном написании проверьте название перед сбором фотографий.</p>
             {candidates.map((c) => (
               <button key={c.qid} className={styles.candidate} onClick={() => loadProfile(c.qid)}>
                 <strong>{c.label}</strong>
@@ -652,6 +671,13 @@ export default function Home() {
                 <summary className={styles.auditSummary}>Как собран этот профиль</summary>
                 <div className={styles.auditGrid}>
                   <span>Якорь координат: {ANCHOR_LABELS[profile.anchor?.source ?? "none"]}</span>
+                  {profile.anchor?.observations.map((point) => (
+                    <span key={point.source}>
+                      {point.source === "places" ? "Google Places" : point.source === "2gis" ? "2ГИС" : "Wikidata"}: {point.name}
+                      {point.address ? `, ${point.address}` : ""} · {point.lat.toFixed(5)}, {point.lon.toFixed(5)}
+                      {point.distanceM > 0 ? ` · ${formatDistance(point.distanceM)} до якоря` : ""}
+                    </span>
+                  ))}
                   <span>С сайта вуза: {profile.sources.official}</span>
                   <span>Из Google Places: {profile.sources.visitors}</span>
                   <span>Дубликатов убрано: {profile.removed.duplicates}</span>
@@ -682,7 +708,7 @@ export default function Home() {
                 </div>
                 <p className={styles.sectionNote}>
                   Места, давшие снимки, и измеренные до них расстояния. Кольцо — порог подтверждения:
-                  внутри 1,5 км снимок считается подтверждённым. Масштаб подстраивается под самое
+                  внутри 1,5 км место проходит географическую проверку; для подтверждения снимка нужны и другие признаки. Масштаб подстраивается под самое
                   дальнее место, поэтому кольцо в 6 км видно не всегда.
                   {profile.cityCenter && ` Луч показывает направление на центр города (${profile.cityCenter.name}).`}
                 </p>
@@ -808,8 +834,20 @@ export default function Home() {
               </div>
               <div className={styles.factRow}>
                 <span className={styles.factKey}>Источник</span>
-                <span>{selected.source === "official_site" ? "сайт вуза" : "Google Places"}</span>
+                <span>{selected.source === "official_site" ? "сайт вуза" : <span className={styles.googleAttribution} translate="no">Google Maps</span>}</span>
               </div>
+              {selected.sourceUrl && (
+                <div className={styles.factRow}>
+                  <span className={styles.factKey}>Ссылка</span>
+                  <a className={styles.link} href={selected.sourceUrl} target="_blank" rel="noreferrer">Открыть оригинал</a>
+                </div>
+              )}
+              {selected.attribution.map((author, i) => (
+                <div className={styles.factRow} key={`${author.name}-${i}`}>
+                  <span className={styles.factKey}>Автор</span>
+                  {author.uri ? <a className={styles.link} href={author.uri} target="_blank" rel="noreferrer">{author.name}</a> : <span>{author.name}</span>}
+                </div>
+              ))}
               <div className={styles.factRow}>
                 <span className={styles.factKey}>{selected.source === "official_site" ? "Страница" : "Место"}</span>
                 <span>{placeLine(selected)}</span>

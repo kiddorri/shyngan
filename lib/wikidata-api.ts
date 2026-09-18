@@ -146,7 +146,7 @@ function looksLikeUniversity(entity: Entity): boolean {
 export async function resolveUniversityViaApi(
   search: string,
   userAgent: string,
-  langs: readonly ("ru" | "en" | "kk")[] = ["ru", "en", "kk"],
+  langs: readonly ("ru" | "en" | "kk" | "zh" | "ko")[] = ["ru", "en", "kk"],
 ): Promise<UniversityCandidate[]> {
   const trimmed = search.trim();
   if (!trimmed) return [];

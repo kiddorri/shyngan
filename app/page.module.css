@@ -331,6 +331,22 @@
   overflow: hidden;
 }
 
+.authorAvatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  object-fit: cover;
+  align-self: center;
+}
+
+.googleAttribution {
+  font-family: Arial, sans-serif;
+  font-size: 12px;
+  font-weight: 400;
+  color: #5e5e5e;
+  white-space: nowrap;
+}
+
 .error {
   margin: 24px 0;
   padding: 14px 16px;
@@ -439,6 +455,7 @@
   border: 1px solid var(--line);
   border-radius: 10px;
   line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .warnings {

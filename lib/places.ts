@@ -41,6 +41,7 @@ export type PlacePhoto = {
   name: string;
   widthPx: number;
   heightPx: number;
+  googleMapsUri?: string;
   authorAttributions?: Array<{
     displayName: string;
     uri?: string;
@@ -74,11 +75,11 @@ export type LocationBias = {
 
 export async function searchText(
   textQuery: string,
-  opts: { bias?: LocationBias; pageSize?: number } = {},
+  opts: { bias?: LocationBias; pageSize?: number; languageCode?: string } = {},
 ): Promise<Place[]> {
   const body: Record<string, unknown> = {
     textQuery,
-    languageCode: "ru",
+    languageCode: opts.languageCode ?? "ru",
     pageSize: Math.min(Math.max(opts.pageSize ?? 3, 1), 20),
   };
 
@@ -171,11 +172,13 @@ export async function getPlaceReviews(placeId: string, limit = 5): Promise<Place
     if (!res.ok) return [];
     const json = (await res.json()) as {
       reviews?: Array<{
-        authorAttribution?: { displayName?: string; uri?: string };
+        authorAttribution?: { displayName?: string; uri?: string; photoUri?: string };
         rating?: number;
         text?: { text?: string; languageCode?: string };
         originalText?: { text?: string; languageCode?: string };
         publishTime?: string;
+        googleMapsUri?: string;
+        visitDate?: { year?: number; month?: number };
       }>;
     };
     return (json.reviews ?? [])
@@ -187,6 +190,10 @@ export async function getPlaceReviews(placeId: string, limit = 5): Promise<Place
       .map((r) => ({
         author: r.authorAttribution?.displayName ?? "аноним",
         authorUri: r.authorAttribution?.uri ?? null,
+        authorPhotoUri: r.authorAttribution?.photoUri ?? null,
+        sourceUrl: r.googleMapsUri ?? null,
+        visitDate: r.visitDate?.year && r.visitDate?.month
+          ? `${String(r.visitDate.month).padStart(2, "0")}.${r.visitDate.year}` : null,
         rating: typeof r.rating === "number" ? r.rating : null,
         text: (r.text?.text ?? r.originalText?.text ?? "").trim(),
         publishedAt: r.publishTime ?? null,

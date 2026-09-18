@@ -5,8 +5,11 @@
 //
 // Если ключа нет — функция возвращает null и профиль работает без 2ГИС.
 
+import { haversineM } from "./geo";
+
 const ENDPOINT = "https://catalog.api.2gis.com/3.0/items";
 const REQUEST_TIMEOUT_MS = 6000;
+const MAX_NEAR_DISTANCE_M = 5000;
 
 export type TwoGisHit = {
   lat: number;
@@ -47,10 +50,18 @@ export async function findInTwoGis(
     const json = (await res.json()) as { result?: { items?: Item[] } };
     const items = json.result?.items ?? [];
 
-    // Организация ("branch") предпочтительнее здания или района.
-    const ordered = [...items.filter((i) => i.type === "branch"), ...items.filter((i) => i.type !== "branch")];
-    const hit = ordered.find((i) => i.point && Number.isFinite(i.point.lat) && Number.isFinite(i.point.lon));
+    // location — мягкое ограничение поиска: первый ответ может оказаться в
+    // другом городе. Берём ближайшую организацию и отбрасываем дальние совпадения.
+    const ordered = items
+      .filter((i) => i.point && Number.isFinite(i.point.lat) && Number.isFinite(i.point.lon))
+      .sort((a, b) =>
+        Number(b.type === "branch") - Number(a.type === "branch") ||
+        (near ? haversineM(near.lat, near.lon, a.point!.lat, a.point!.lon) -
+          haversineM(near.lat, near.lon, b.point!.lat, b.point!.lon) : 0),
+      );
+    const hit = ordered[0];
     if (!hit || !hit.point) return null;
+    if (near && haversineM(near.lat, near.lon, hit.point.lat, hit.point.lon) > MAX_NEAR_DISTANCE_M) return null;
 
     return {
       lat: hit.point.lat,

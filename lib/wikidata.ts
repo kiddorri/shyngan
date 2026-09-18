@@ -30,7 +30,11 @@ const CYRILLIC = /[а-яёА-ЯЁ]/;
  * ru/kk первым. Ни один язык не выпадает: остальные два всё равно проверяются,
  * это только порядок, а не фильтр.
  */
-function languageOrder(search: string): readonly ("ru" | "en" | "kk")[] {
+type SearchLanguage = "ru" | "en" | "kk" | "zh" | "ko";
+
+function languageOrder(search: string): readonly SearchLanguage[] {
+  if (/[\uAC00-\uD7AF]/u.test(search)) return ["ko", "en", "ru", "kk"];
+  if (/[\u3400-\u9FFF]/u.test(search)) return ["zh", "en", "ru", "kk"];
   if (KAZAKH_LETTERS.test(search)) return ["kk", "ru", "en"];
   if (CYRILLIC.test(search)) return ["ru", "kk", "en"];
   return ["en", "ru", "kk"];
@@ -50,7 +54,11 @@ const UNIVERSITY_CLASS = "wd:Q3918";
 
 // Общий набор полей. ?item должен быть связан до вставки этого фрагмента.
 const FIELDS_FRAGMENT = `
-  ?item wdt:P31/wdt:P279* ${HIGHER_EDU_CLASS}.
+  # В Wikidata ветки «университет» и «учреждение высшего образования» не всегда
+  # соединены через P279. Например, головной вуз может быть public university,
+  # тогда как его факультеты попадают в Q38723. Проверяем обе ветки.
+  VALUES ?educationClass { ${HIGHER_EDU_CLASS} ${UNIVERSITY_CLASS} }
+  ?item wdt:P31/wdt:P279* ?educationClass.
   OPTIONAL { ?item wdt:P625 ?coord. }
   OPTIONAL { ?item wdt:P856 ?website. }
   # Страна и город берутся только из действующих утверждений: у старых вузов
@@ -86,7 +94,7 @@ function escapeLiteral(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-function buildSearchQuery(search: string, lang: "ru" | "kk" | "en"): string {
+function buildSearchQuery(search: string, lang: SearchLanguage): string {
   return `
 ${SELECT_HEAD}
   SERVICE wikibase:mwapi {
@@ -95,10 +103,12 @@ ${SELECT_HEAD}
     bd:serviceParam mwapi:search "${escapeLiteral(search)}".
     bd:serviceParam mwapi:language "${lang}".
     ?item wikibase:apiOutputItem mwapi:item.
+    ?searchRank wikibase:apiOrdinal true.
   }
 ${FIELDS_FRAGMENT}
 }
-LIMIT 10
+ORDER BY ASC(?searchRank)
+LIMIT 80
 `.trim();
 }
 

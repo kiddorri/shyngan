@@ -50,12 +50,14 @@ export function describeCampus(
   }
 
   // 4. Чем подтверждали.
-  if (anchor?.source === "wikidata") {
-    parts.push("Координаты кампуса взяты из Wikidata и сверены с Google Places.");
-  } else if (anchor?.source === "places+2gis") {
-    parts.push("Координат в Wikidata нет; расположение подтверждено совпадением Google Places и 2ГИС.");
+  if (anchor?.disputed) {
+    parts.push("Источники расходятся в расположении кампуса; географическая проверка ограничена.");
+  } else if (anchor?.source.includes("+")) {
+    parts.push("Расположение кампуса подтверждено совпадением независимых картографических источников.");
+  } else if (anchor?.source === "wikidata") {
+    parts.push("Координаты кампуса известны только из Wikidata; независимого совпадения не найдено.");
   } else if (anchor?.source === "places") {
-    parts.push("Координат в Wikidata нет; расположение известно только по Google Places, поэтому доверие понижено.");
+    parts.push("Расположение известно только по Google Places, поэтому доверие понижено.");
   }
 
   // Расстояние до центра города — измеренная величина, а не оценка «близко к центру».

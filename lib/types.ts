@@ -50,7 +50,14 @@ export const SOURCE_LABELS: Record<PhotoSource, string> = {
 };
 
 /** Откуда взяты координаты, относительно которых считалось расстояние. */
-export type AnchorSource = "wikidata" | "places" | "places+2gis" | "none";
+export type AnchorSource =
+  | "wikidata+places+2gis"
+  | "wikidata+places"
+  | "wikidata+2gis"
+  | "places+2gis"
+  | "wikidata"
+  | "places"
+  | "none";
 
 /** Каким путём получена карточка.
  *  sparql — основной путь через Wikidata.
@@ -157,6 +164,16 @@ export type Anchor = {
   lat: number;
   lon: number;
   source: Exclude<AnchorSource, "none">;
+  /** Сравниваем все найденные точки, а не скрываем отличающиеся ответы. */
+  observations: Array<{
+    source: "wikidata" | "places" | "2gis";
+    name: string;
+    address: string | null;
+    lat: number;
+    lon: number;
+    distanceM: number;
+  }>;
+  disputed: boolean;
 };
 
 /** Центр города по данным OpenStreetMap (Nominatim). Нужен для расстояния «кампус —
@@ -189,6 +206,9 @@ export type MapPoint = {
 export type PlaceReview = {
   author: string;
   authorUri: string | null;
+  authorPhotoUri: string | null;
+  sourceUrl: string | null;
+  visitDate: string | null;
   rating: number | null;
   text: string;
   /** ISO-дата публикации отзыва — реальная, от платформы. */

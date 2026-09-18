@@ -3,8 +3,8 @@
 //
 //   1. Wikidata SPARQL      — есть независимые координаты и проверка «это вуз» по подклассам
 //   2. Wikidata Action API  — тот же источник, другая дверь; включается при отказе SPARQL
-//   3. Google Places        — вуза нет в Wikidata вообще (так бывает у части казахстанских вузов
-//                             и почти всегда у аббревиатур, которых нет в псевдонимах Wikidata)
+//   3. Google Places        — дополнительный поиск при слабом ответе, аббревиатуре
+//                             или недоступности Wikidata
 //
 // Третий путь принципиально слабее: координаты и сайт приходят из того же провайдера,
 // что и фотографии, поэтому независимого подтверждения у него нет. Профиль сообщает
@@ -18,9 +18,53 @@ import { getUniversityByQid, resolveUniversity, WikidataUnavailableError } from 
 export const PLACES_ID_PREFIX = "places:";
 
 /** Слова, по которым место из Places считается учебным заведением. */
-const UNIVERSITY_NAME = /универс|инстит|академи|колледж|консерватор|universit|institut|academy|college/i;
+const UNIVERSITY_NAME = /универс|инстит|академи|колледж|консерватор|universit|institut|academy|college|大学|大學|学院|學院|대학교|대학|과학기술원/iu;
 
 const MAX_PLACES_CANDIDATES = 5;
+
+function words(value: string): string[] {
+  return value.normalize("NFKC").toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+function closeWord(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (a.length < 4 || b.length < 4 || Math.abs(a.length - b.length) > 1) return false;
+  // Одна замена, вставка или удаление: помогает с опечаткой, но не принимает
+  // произвольный вуз из ответа полнотекстового поиска Places.
+  let i = 0;
+  let j = 0;
+  let edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i++; j++; continue; }
+    if (++edits > 1) return false;
+    if (a.length > b.length) i++;
+    else if (b.length > a.length) j++;
+    else { i++; j++; }
+  }
+  return edits + Number(i < a.length || j < b.length) <= 1;
+}
+
+function nameMatchesQuery(query: string, label: string): boolean {
+  const q = words(query).filter((w) => !/^(university|universitet|college|университет|колледж)$/.test(w));
+  const name = words(label);
+  if (q.length === 0 || name.length === 0) return false;
+  if (q.length === 1 && q[0].length <= 5 && /^[a-z]+$/.test(q[0])) {
+    const initials = name.filter((w) => !/^(of|the|and)$/.test(w)).map((w) => w[0]).join("");
+    if (initials === q[0]) return true;
+  }
+  return q.filter((token) => name.some((part) => closeWord(token, part))).length >= Math.ceil(q.length / 2);
+}
+
+function sameWebsite(a: string | null, b: string | null): boolean {
+  if (!a || !b) return false;
+  try {
+    const first = new URL(a).hostname.replace(/^www\./, "").toLowerCase();
+    const second = new URL(b).hostname.replace(/^www\./, "").toLowerCase();
+    return first === second || first.endsWith(`.${second}`) || second.endsWith(`.${first}`);
+  } catch {
+    return false;
+  }
+}
 
 export function isPlacesId(id: string): boolean {
   return id.startsWith(PLACES_ID_PREFIX);
@@ -53,14 +97,21 @@ function placeToCandidate(place: {
   };
 }
 
-/** Поиск вуза в Google Places по названию. Используется, когда Wikidata его не знает. */
+/** Поиск вуза в Google Places по названию при слабом ответе или сбое Wikidata. */
 export async function resolveViaPlaces(search: string): Promise<UniversityCandidate[]> {
   const trimmed = search.trim();
   if (!trimmed) return [];
   try {
-    const places = await searchText(trimmed, { pageSize: MAX_PLACES_CANDIDATES });
+    const options = {
+      pageSize: MAX_PLACES_CANDIDATES,
+      languageCode: /[\uAC00-\uD7AF]/u.test(trimmed) ? "ko"
+        : /[\u3400-\u9FFF]/u.test(trimmed) ? "zh-CN"
+        : /^[\x00-\x7F]+$/.test(trimmed) ? "en" : "ru",
+    };
+    const places = await searchText(trimmed, options);
     return places
-      .filter((p) => UNIVERSITY_NAME.test(p.displayName?.text ?? ""))
+      .filter((p) => UNIVERSITY_NAME.test(p.displayName?.text ?? "") &&
+        nameMatchesQuery(trimmed, p.displayName?.text ?? ""))
       .map(placeToCandidate);
   } catch {
     return [];
@@ -72,9 +123,56 @@ export async function resolveViaPlaces(search: string): Promise<UniversityCandid
  * Пустой результат означает, что вуза не нашёл ни один источник.
  */
 export async function resolveAny(search: string): Promise<UniversityCandidate[]> {
-  const fromWikidata = await resolveUniversity(search);
-  if (fromWikidata.length > 0) return fromWikidata;
-  return resolveViaPlaces(search);
+  const acronym = /^[A-Z]{2,5}$/.test(search.trim());
+  // Для коротких аббревиатур Wikidata часто знает другое учреждение с тем же
+  // псевдонимом. Второй источник нужен всегда, поэтому не ждём первый впустую.
+  const placesPromise = acronym ? resolveViaPlaces(search) : null;
+  let fromWikidata: UniversityCandidate[] = [];
+  let wikidataError: WikidataUnavailableError | null = null;
+  try {
+    fromWikidata = await resolveUniversity(search);
+  } catch (e) {
+    if (!(e instanceof WikidataUnavailableError)) throw e;
+    wikidataError = e;
+  }
+  // EntitySearch может найти точное совпадение с опечаткой в названии малоизвестного
+  // учреждения. Если у всех результатов нет ни сайта, ни координат, проверяем
+  // запрос ещё и по Places. Иначе один такой результат автоматически откроется
+  // как профиль, хотя пользователь мог иметь в виду другой университет.
+  if (!acronym && fromWikidata.some((c) => c.officialWebsite || (c.lat !== null && c.lon !== null))) {
+    return fromWikidata;
+  }
+  const fromPlaces = await (placesPromise ?? resolveViaPlaces(search));
+  if (wikidataError && fromPlaces.length === 0) throw wikidataError;
+  // Places умеет исправлять опечатки, но его карточка сама по себе не даёт
+  // независимого подтверждения координат. Повторно ищем первое подходящее имя
+  // в Wikidata и связываем карточки только при совпадении официального домена.
+  const suggested = fromPlaces.find((c) => c.officialWebsite);
+  const verifiedExisting = suggested && fromWikidata.find((c) => sameWebsite(c.officialWebsite, suggested.officialWebsite));
+  if (verifiedExisting) {
+    return [verifiedExisting, ...fromWikidata.filter((c) => c.qid !== verifiedExisting.qid),
+      ...fromPlaces.filter((c) => !sameWebsite(c.officialWebsite, verifiedExisting.officialWebsite))];
+  }
+  if (!wikidataError && suggested && suggested.label.toLocaleLowerCase() !== search.trim().toLocaleLowerCase()) {
+    try {
+      const verified = await resolveUniversity(suggested.label);
+      const match = verified.find((c) => sameWebsite(c.officialWebsite, suggested.officialWebsite));
+      if (match) {
+        return [match, ...fromWikidata.filter((c) => c.qid !== match.qid)];
+      }
+    } catch {
+      // Places всё равно остаётся доступным вариантом для ручного выбора.
+    }
+  }
+  const seen = new Set(fromWikidata.map((c) => c.officialWebsite?.replace(/\/$/, "").toLowerCase()).filter(Boolean));
+  const additional = fromPlaces.filter((c) => {
+    const site = c.officialWebsite?.replace(/\/$/, "").toLowerCase();
+    return !site || !seen.has(site);
+  });
+  // Адрес сайта здесь полезнее буквального совпадения: это хотя бы проверяемая
+  // точка входа для сбора снимков. Выбор в любом случае остаётся за человеком.
+  return [...additional.filter((c) => c.officialWebsite), ...fromWikidata,
+    ...additional.filter((c) => !c.officialWebsite)];
 }
 
 /** Карточка по идентификатору: QID из Wikidata либо places:<place_id>. */

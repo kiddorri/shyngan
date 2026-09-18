@@ -12,7 +12,8 @@
 import { describeCampus } from "./describe";
 import { haversineM } from "./geo";
 import { dHash, hamming, loadImage, sharpness, type LoadedImage } from "./image";
-import { collectOfficialImages } from "./official";
+import { chooseAnchor, AGREEMENT_RADIUS_M, type LocationObservation } from "./location";
+import { collectOfficialImages, type OfficialResult } from "./official";
 import { findCityCenter } from "./osm";
 import { getPhotoUri, getPlaceReviews, searchText, type Place } from "./places";
 import { findInTwoGis } from "./twogis";
@@ -44,8 +45,6 @@ const PROBABLE_RADIUS_M = 6000;
 const SEARCH_BIAS_RADIUS_M = 5000;
 /** Радиус поиска общественных мест вокруг кампуса: парки и кафе, до которых студент дойдёт пешком. */
 const NEIGHBORHOOD_BIAS_RADIUS_M = 2000;
-/** Точки Places и 2ГИС ближе этого порога считаются одним и тем же местом. */
-const CORROBORATION_RADIUS_M = 500;
 
 /** Кейс прямо говорит: пятнадцать проверенных снимков ценнее сотни случайных.
  *  Отсюда все лимиты ниже: они режут не качество, а повторы одного и того же. */
@@ -172,6 +171,7 @@ function assessTrust(
   anchor: Anchor | null,
   anchorPlaceId: string | null,
   universityLabel: string,
+  universityWebsite: string | null,
 ): { trust: TrustTier; distanceM: number | null; reasons: string[] } {
   const reasons: string[] = [`Место найдено через Google Places (place_id ${place.id})`];
 
@@ -201,6 +201,23 @@ function assessTrust(
   if (distanceM <= VERIFIED_RADIUS_M) {
     trust = "verified";
     reasons.push(`Расстояние до кампуса ${distanceM} м (порог ${VERIFIED_RADIUS_M} м)`);
+    // Близость к кампусу подтверждает район, но рядом бывают чужие учреждения.
+    // Для бейджа «Подтверждено» нужен ещё признак принадлежности самого места.
+    const siteMatches = (() => {
+      if (!place.websiteUri || !universityWebsite) return false;
+      try {
+        const a = new URL(place.websiteUri).hostname.replace(/^www\./, "");
+        const b = new URL(universityWebsite).hostname.replace(/^www\./, "");
+        return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+      } catch { return false; }
+    })();
+    if (siteMatches) reasons.push("Сайт места находится на домене университета");
+    else if (nameLooksLikeUniversity(place.displayName?.text ?? "", universityLabel)) {
+      reasons.push("Название места совпадает с названием университета");
+    } else {
+      trust = "probable";
+      reasons.push("Место рядом с кампусом, но его название и сайт не подтверждают принадлежность университету");
+    }
   } else if (distanceM <= PROBABLE_RADIUS_M) {
     trust = "probable";
     reasons.push(`Расстояние до кампуса ${distanceM} м — дальше ${VERIFIED_RADIUS_M} м, но в пределах ${PROBABLE_RADIUS_M} м`);
@@ -216,8 +233,17 @@ function assessTrust(
   }
 
   switch (anchor.source) {
+    case "wikidata+places+2gis":
+      reasons.push("Расположение сверено по Wikidata, Google Places и 2ГИС");
+      break;
+    case "wikidata+places":
+      reasons.push("Расположение сверено по Wikidata и Google Places");
+      break;
+    case "wikidata+2gis":
+      reasons.push("Расположение сверено по Wikidata и 2ГИС");
+      break;
     case "wikidata":
-      reasons.push("Якорные координаты: Wikidata (независимый источник)");
+      reasons.push("Якорные координаты: Wikidata; второй источник не подтвердил точку");
       break;
     case "places+2gis":
       reasons.push("Координат в Wikidata нет; якорь из Google Places подтверждён 2ГИС (второй независимый провайдер)");
@@ -226,6 +252,11 @@ function assessTrust(
       reasons.push("Координат в Wikidata нет — якорь взят из Google Places без подтверждения, доверие понижено на один уровень");
       trust = downgrade(trust);
       break;
+  }
+
+  if (anchor.disputed) {
+    reasons.push("Найденные источники расходятся по расположению — доверие понижено");
+    trust = downgrade(trust);
   }
 
   return { trust, distanceM, reasons };
@@ -303,7 +334,11 @@ function assessCityTrust(
   }
 
   const nearEnough = distanceM !== null && distanceM <= SAME_CITY_RADIUS_M;
-  const trust: TrustTier = addressHasCity && nearEnough ? "verified" : addressHasCity || nearEnough ? "probable" : "unverified";
+  let trust: TrustTier = addressHasCity && nearEnough ? "verified" : addressHasCity || nearEnough ? "probable" : "unverified";
+  if (anchor?.disputed) {
+    trust = downgrade(trust);
+    reasons.push("Источники расходятся по расположению кампуса — проверка расстояния до города ограничена");
+  }
   return { trust, distanceM, reasons };
 }
 
@@ -317,6 +352,7 @@ async function placeToRaw(
   cityName: string | null,
   campusCity: string | null,
   universityLabel: string,
+  universityWebsite: string | null,
   photosPerPlace: number,
 ): Promise<RawPhoto[]> {
   const perPlace = category === "city" || category === "citywide" ? CITY_PHOTOS_PER_PLACE : photosPerPlace;
@@ -326,7 +362,7 @@ async function placeToRaw(
   const { trust, distanceM, reasons } =
     category === "citywide"
       ? assessCityTrust(place, anchor, cityName, campusCity)
-      : assessTrust(place, anchor, anchorPlaceId, universityLabel);
+      : assessTrust(place, anchor, anchorPlaceId, universityLabel, universityWebsite);
   const placeName = place.displayName?.text ?? place.id;
   const uris = await Promise.all(photos.map((p) => getPhotoUri(p.name)));
 
@@ -340,7 +376,7 @@ async function placeToRaw(
       // Google Places не сообщает, когда сделан или опубликован снимок. Никогда.
       publishedAt: null,
       imageUrl,
-      sourceUrl: place.googleMapsUri ?? null,
+      sourceUrl: p.googleMapsUri ?? place.googleMapsUri ?? null,
       attribution: (p.authorAttributions ?? []).map((a) => ({ name: a.displayName, uri: a.uri ?? null })),
       category,
       trust,
@@ -487,7 +523,7 @@ export async function buildProfile(
     warnings.push(
       // Про координаты здесь говорить нельзя: расположение проверяется ниже, и 2ГИС
       // вполне может его подтвердить. Эта строка — только про карточку вуза.
-      "Этого вуза нет в Wikidata: название и официальный сайт взяты из Google Places — того же источника, что и часть фотографий, поэтому независимого подтверждения у них нет. Координат Wikidata у такого вуза тоже нет, расположение проверяется отдельно.",
+      "Карточка вуза получена только из Google Places: название и сайт пока не подтверждены независимым источником. Координаты Wikidata для этой карточки недоступны; расположение проверяется отдельно.",
     );
   }
   if (university.resolvedVia === "action-api") {
@@ -514,43 +550,72 @@ export async function buildProfile(
     university.lat !== null && university.lon !== null
       ? { lat: university.lat, lon: university.lon, radiusM: SEARCH_BIAS_RADIUS_M }
       : undefined;
+  const twoGisPromise = wikidataBias
+    ? findInTwoGis(university.label, wikidataBias)
+    : null;
+
+  // Обход сайта не зависит от координат и запросов Places. Запускаем его сразу,
+  // пока остальные источники определяют кампус и соседние места.
+  const officialPromise: Promise<OfficialResult> = university.officialWebsite
+    ? collectOfficialImages(university.officialWebsite, USER_AGENT, {
+        deep: mode === "deep",
+        maxCandidates: mode === "deep" ? undefined : limits.maxOfficialPhotos * 2,
+      }).catch((e) => ({
+        candidates: [], pagesVisited: [], blockedByRobots: [], robotsNote: null,
+        skippedForTime: 0, error: `сайт недоступен: ${(e as Error).message}`,
+      }))
+    : Promise.resolve({
+        candidates: [], pagesVisited: [], blockedByRobots: [], robotsNote: null,
+        skippedForTime: 0, error: "официальный сайт вуза неизвестен",
+      });
 
   let campusPlaces: Place[] = [];
   try {
     campusPlaces = campusQuery
-      ? await searchText(campusQuery, { bias: wikidataBias, pageSize: campusPlan.pageSize })
+      ? await searchText(campusQuery, { bias: wikidataBias, pageSize: Math.max(3, campusPlan.pageSize) })
       : [];
   } catch (e) {
     warnings.push(`Places: основной запрос не выполнен (${(e as Error).message})`);
   }
-  const campusPlace = campusPlaces[0];
-
-  // 2. Якорь: Wikidata → Places+2ГИС → Places → нет.
-  let anchor: Anchor | null = null;
-  if (university.lat !== null && university.lon !== null) {
-    anchor = { lat: university.lat, lon: university.lon, source: "wikidata" };
-  } else if (campusPlace?.location) {
-    const placesPoint = { lat: campusPlace.location.latitude, lon: campusPlace.location.longitude };
-    const twoGis = await findInTwoGis(university.label, placesPoint);
-    if (twoGis) {
-      const gap = haversineM(placesPoint.lat, placesPoint.lon, twoGis.lat, twoGis.lon);
-      if (gap <= CORROBORATION_RADIUS_M) {
-        anchor = { ...placesPoint, source: "places+2gis" };
-        warnings.push(`В Wikidata нет координат кампуса; Google Places и 2ГИС сошлись на расположении с расхождением ${gap} м${twoGis.address ? ` (2ГИС: ${twoGis.address})` : ""}`);
-      } else {
-        anchor = { ...placesPoint, source: "places" };
-        warnings.push(`В Wikidata нет координат кампуса; 2ГИС указывает точку в ${gap} м от Google Places — подтверждения нет, доверие понижено`);
+  const siteHost = (url: string | null) => {
+    try { return url ? new URL(url).hostname.replace(/^www\./, "") : null; }
+    catch { return null; }
+  };
+  const officialDomain = siteHost(university.officialWebsite);
+  const campusPlace = [...campusPlaces].sort((a, b) => {
+    const score = (p: Place) => {
+      let value = 0;
+      const host = siteHost(p.websiteUri ?? null);
+      if (host && officialDomain && (host === officialDomain || host.endsWith(`.${officialDomain}`))) value += 10;
+      if (wikidataBias && p.location) {
+        const distance = haversineM(wikidataBias.lat, wikidataBias.lon, p.location.latitude, p.location.longitude);
+        if (distance <= AGREEMENT_RADIUS_M) value += 5;
+        else if (distance > 10000) value -= 10;
       }
-    } else {
-      anchor = { ...placesPoint, source: "places" };
-      warnings.push(
-        process.env.TWOGIS_API_KEY
-          ? "В Wikidata нет координат кампуса; 2ГИС не нашёл организацию — якорь только из Google Places, доверие понижено"
-          : "В Wikidata нет координат кампуса — якорь взят из Google Places, доверие понижено (ключ 2ГИС не задан)",
-      );
+      return value;
+    };
+    return score(b) - score(a);
+  })[0];
+
+  // 2. Сверка всех доступных точек: Wikidata, Google Places и 2ГИС.
+  const googlePoint = campusPlace?.location
+    ? { lat: campusPlace.location.latitude, lon: campusPlace.location.longitude }
+    : null;
+  const twoGis = await (twoGisPromise ?? (googlePoint ? findInTwoGis(university.label, googlePoint) : Promise.resolve(null)));
+  const points: LocationObservation[] = [];
+  if (wikidataBias) points.push({ source: "wikidata", name: university.label, address: null, lat: wikidataBias.lat, lon: wikidataBias.lon });
+  if (googlePoint) points.push({ source: "places", name: campusPlace.displayName?.text ?? university.label,
+    address: campusPlace.formattedAddress ?? null, ...googlePoint });
+  if (twoGis) points.push({ source: "2gis", name: twoGis.name, address: twoGis.address,
+    lat: twoGis.lat, lon: twoGis.lon });
+  const anchor: Anchor | null = chooseAnchor(points);
+  if (!anchor) warnings.push("Координаты кампуса не найдены — проверка расстояния невозможна");
+  else if (anchor.disputed) warnings.push("Источники указывают разные точки кампуса; расстояния рассчитаны от выбранной точки, доверие снижено. Сравнение координат открывается в разделе «Как собран этот профиль».");
+  else if (anchor.observations.length === 1) warnings.push(`Расположение сообщил только один источник (${anchor.source}); независимой сверки координат нет.`);
+  else {
+    for (const observation of anchor.observations.filter((p) => p.distanceM > AGREEMENT_RADIUS_M)) {
+      warnings.push(`${observation.source} указывает точку в ${observation.distanceM} м от выбранного якоря; она не использована для подтверждения.`);
     }
-  } else {
-    warnings.push("Координаты кампуса не найдены ни в Wikidata, ни в Places — проверка расстояния невозможна");
   }
   onProgress({ stage: "anchor", source: anchor?.source ?? "none" });
 
@@ -578,10 +643,10 @@ export async function buildProfile(
 
   // Город кампуса по данным карт — эталон для сверки городских снимков.
   const campusCity = campusPlace ? localityOf(campusPlace) : null;
-  const anchorPlaceId = anchor?.source !== "wikidata" && campusPlace ? campusPlace.id : null;
+  const anchorPlaceId = anchor && ["places", "places+2gis"].includes(anchor.source) && campusPlace ? campusPlace.id : null;
   const bias = anchor ? { lat: anchor.lat, lon: anchor.lon, radiusM: SEARCH_BIAS_RADIUS_M } : undefined;
 
-  // 3. Остальные запросы к Places и главная страница сайта — параллельно.
+  // 3. Остальные запросы к Places. Обход официального сайта уже выполняется.
   const [restResults, official] = await Promise.all([
     Promise.all(
       restPlan.map(async (item) => {
@@ -599,21 +664,7 @@ export async function buildProfile(
         }
       }),
     ),
-    university.officialWebsite
-      ? collectOfficialImages(university.officialWebsite, USER_AGENT, {
-          deep: mode === "deep",
-          // Быстрому взгляду хватает вдвое большего запаса, чем он покажет: часть
-          // кандидатов отсеется по размеру и резкости. Всё сверх этого — лишние секунды.
-          maxCandidates: mode === "deep" ? undefined : limits.maxOfficialPhotos * 2,
-        })
-      : Promise.resolve({
-          candidates: [],
-          pagesVisited: [] as string[],
-          blockedByRobots: [] as string[],
-          robotsNote: null,
-          skippedForTime: 0,
-          error: "официальный сайт вуза неизвестен",
-        }),
+    officialPromise,
   ]);
 
   // Одно место — одна категория. Первое вхождение побеждает (campus идёт первым).
@@ -636,7 +687,7 @@ export async function buildProfile(
   // и категория остаётся пустой не потому, что снимков не нашлось.
   const perPlace = await Promise.all(
     jobs.map((j) =>
-      placeToRaw(j.place, j.category, anchor, anchorPlaceId, university.city, campusCity, university.label, limits.photosPerPlace),
+      placeToRaw(j.place, j.category, anchor, anchorPlaceId, university.city, campusCity, university.label, university.officialWebsite, limits.photosPerPlace),
     ),
   );
   const placesRaw = interleave(perPlace, limits.maxPlacesPhotos);
