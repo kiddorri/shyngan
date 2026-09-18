@@ -834,7 +834,11 @@ export default function Home() {
               </div>
               <div className={styles.factRow}>
                 <span className={styles.factKey}>Получено</span>
-                <span>{formatRetrieved(selected.retrievedAt)} · дата публикации неизвестна</span>
+                <span>{formatRetrieved(selected.retrievedAt)}</span>
+              </div>
+              <div className={styles.factRow}>
+                <span className={styles.factKey}>Публикация</span>
+                <span>{selected.publishedAt ? formatRetrieved(selected.publishedAt) : "дата публикации неизвестна"}</span>
               </div>
               {selected.hash && (
                 <div className={styles.factRow}>
