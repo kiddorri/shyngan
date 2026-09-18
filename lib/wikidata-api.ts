@@ -133,24 +133,42 @@ function looksLikeUniversity(entity: Entity): boolean {
 }
 
 /**
- * Поиск вуза по названию через Action API. Пробует ru → en → kk.
+ * Поиск вуза по названию через Action API. Пробует языки в переданном порядке
+ * (по умолчанию ru → en → kk — тот же порядок, что раньше был единственным).
  * Возвращает кандидатов в том же формате, что и SPARQL-путь.
+ *
+ * Сбой одного языка (сеть, троттлинг) не должен обрывать перебор остальных: если
+ * ru упал, а en ответил — результат en всё равно нужен. «Не нашли» и «сервис не
+ * ответил» — разные исходы, поэтому исключение прокидывается наверх только тогда,
+ * когда упали ВСЕ языки; если хотя бы один ответил (пусть и пустым списком), это
+ * означает «вуза нет», а не «Wikidata недоступна».
  */
 export async function resolveUniversityViaApi(
   search: string,
   userAgent: string,
+  langs: readonly ("ru" | "en" | "kk")[] = ["ru", "en", "kk"],
 ): Promise<UniversityCandidate[]> {
   const trimmed = search.trim();
   if (!trimmed) return [];
 
   let hits: SearchHit[] = [];
-  for (const lang of ["ru", "en", "kk"] as const) {
-    const json = (await callApi(
-      { action: "wbsearchentities", search: trimmed, language: lang, uselang: lang, type: "item", limit: "10" },
-      userAgent,
-    )) as { search?: SearchHit[] };
-    hits = json.search ?? [];
-    if (hits.length > 0) break;
+  let lastError: unknown = null;
+  for (const lang of langs) {
+    try {
+      const json = (await callApi(
+        { action: "wbsearchentities", search: trimmed, language: lang, uselang: lang, type: "item", limit: "10" },
+        userAgent,
+      )) as { search?: SearchHit[] };
+      hits = json.search ?? [];
+      lastError = null;
+      if (hits.length > 0) break;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  if (hits.length === 0) {
+    if (lastError) throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    return [];
   }
 
   const qids = hits.map((h) => h.id).filter((x): x is string => typeof x === "string" && /^Q\d+$/.test(x));

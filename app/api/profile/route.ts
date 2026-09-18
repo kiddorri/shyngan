@@ -20,7 +20,11 @@ const NDJSON_HEADERS = {
 };
 
 export async function GET(req: Request): Promise<Response> {
-  const qid = new URL(req.url).searchParams.get("qid") ?? "";
+  const params = new URL(req.url).searchParams;
+  const qid = params.get("qid") ?? "";
+  // Быстрый взгляд — по умолчанию: он дешевле и укладывается в несколько секунд.
+  // Полный сбор запускается только по явной просьбе пользователя.
+  const mode = params.get("mode") === "deep" ? "deep" : "quick";
 
   // Идентификатор вуза: QID из Wikidata либо places:<place_id> для вузов вне Wikidata.
   if (!/^Q\d+$/.test(qid) && !/^places:[\w-]+$/.test(qid)) {
@@ -51,7 +55,7 @@ export async function GET(req: Request): Promise<Response> {
       const send = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
       send({ type: "university", university });
       try {
-        const profile = await buildProfile(university, (e: ProgressEvent) => send({ type: "progress", ...e }));
+        const profile = await buildProfile(university, (e: ProgressEvent) => send({ type: "progress", ...e }), mode);
         send({ type: "profile", ...profile });
       } catch (e) {
         send({ type: "error", error: `Не удалось собрать профиль: ${(e as Error).message}` });

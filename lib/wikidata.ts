@@ -14,6 +14,28 @@ const REQUEST_TIMEOUT_MS = 8000;
 /** SPARQL-сервис отдаёт 429 при нескольких запросах подряд — жюри вводит вузы именно так. */
 const SPARQL_RETRY_DELAY_MS = 1200;
 
+/** Казахские буквы, которых нет в русском алфавите. */
+const KAZAKH_LETTERS = /[әғқңөұүһі]/i;
+const CYRILLIC = /[а-яёА-ЯЁ]/;
+
+/**
+ * Порядок языков для поиска в EntitySearch зависит от алфавита запроса.
+ *
+ * EntitySearch ищет по меткам и алиасам ИМЕННО заданного языка, а не по всем сразу.
+ * Раньше порядок был всегда ["ru","en","kk"]: запрос «Harvard» сначала уходил с
+ * language=ru, и если у карточки в Wikidata нет русского алиаса «Harvard» (для
+ * большинства зарубежных вузов его и нет), первая попытка возвращала пусто —
+ * заведомо впустую потраченный запрос перед тем, что мог сработать. Раз запрос
+ * набран латиницей, разумнее спрашивать en первым, а кириллицу и казахские буквы —
+ * ru/kk первым. Ни один язык не выпадает: остальные два всё равно проверяются,
+ * это только порядок, а не фильтр.
+ */
+function languageOrder(search: string): readonly ("ru" | "en" | "kk")[] {
+  if (KAZAKH_LETTERS.test(search)) return ["kk", "ru", "en"];
+  if (CYRILLIC.test(search)) return ["ru", "kk", "en"];
+  return ["en", "ru", "kk"];
+}
+
 /** Сервис не ответил (429, 5xx, таймаут). Отличается от «вуз не найден». */
 export class WikidataUnavailableError extends Error {}
 
@@ -31,16 +53,34 @@ const FIELDS_FRAGMENT = `
   ?item wdt:P31/wdt:P279* ${HIGHER_EDU_CLASS}.
   OPTIONAL { ?item wdt:P625 ?coord. }
   OPTIONAL { ?item wdt:P856 ?website. }
-  OPTIONAL { ?item wdt:P17 ?country. }
-  OPTIONAL { ?item wdt:P131 ?city. }
+  # Страна и город берутся только из действующих утверждений: у старых вузов
+  # в Wikidata остаётся «СССР» с датой окончания, и без этого фильтра профиль
+  # сообщал, что академия находится в Советском Союзе.
+  OPTIONAL {
+    ?item p:P17 ?countryStmt.
+    ?countryStmt ps:P17 ?country.
+    FILTER NOT EXISTS { ?countryStmt pq:P582 ?countryEnd. }
+    FILTER NOT EXISTS { ?countryStmt wikibase:rank wikibase:DeprecatedRank. }
+  }
+  OPTIONAL {
+    ?item p:P131 ?cityStmt.
+    ?cityStmt ps:P131 ?city.
+    FILTER NOT EXISTS { ?cityStmt pq:P582 ?cityEnd. }
+    FILTER NOT EXISTS { ?cityStmt wikibase:rank wikibase:DeprecatedRank. }
+  }
   OPTIONAL { ?item wdt:P18 ?image. }
+  # Число языковых разделов — мера известности. Нужна для порядка выдачи: по запросу
+  # «Harward» строковое совпадение выигрывает безвестный колледж, а человек имел в
+  # виду Гарвард. Это не фильтр — отбрасывать по известности нельзя, малый
+  # региональный вуз тоже должен находиться, — а только порядок кандидатов.
+  OPTIONAL { ?item wikibase:sitelinks ?sitelinks. }
   OPTIONAL { ?item wdt:P31 ?instanceUni. ?instanceUni wdt:P279* ${UNIVERSITY_CLASS}. }
   OPTIONAL { ?item wdt:P31 ?instance. ?instance wdt:P279* ${HIGHER_EDU_CLASS}. }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "ru,kk,en". }
 `;
 
 const SELECT_HEAD =
-  "SELECT ?item ?itemLabel ?coord ?website ?countryLabel ?cityLabel ?image ?instanceLabel ?instanceUniLabel WHERE {";
+  "SELECT ?item ?itemLabel ?coord ?website ?countryLabel ?cityLabel ?image ?instanceLabel ?instanceUniLabel ?sitelinks WHERE {";
 
 function escapeLiteral(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -112,6 +152,7 @@ async function runSparql(query: string): Promise<UniversityCandidate[]> {
   // Один ?item может прийти несколькими строками (разные OPTIONAL-комбинации).
   // Схлопываем по QID, сохраняя первое непустое значение каждого поля.
   const byQid = new Map<string, UniversityCandidate>();
+  const sitelinksByQid = new Map<string, number>();
 
   for (const b of bindings) {
     const qid = b.item?.value.split("/").pop();
@@ -119,6 +160,10 @@ async function runSparql(query: string): Promise<UniversityCandidate[]> {
 
     const prev = byQid.get(qid);
     const { lat, lon } = parsePoint(b.coord?.value);
+    const sitelinks = Number.parseInt(b.sitelinks?.value ?? "", 10);
+    if (Number.isFinite(sitelinks)) {
+      sitelinksByQid.set(qid, Math.max(sitelinksByQid.get(qid) ?? 0, sitelinks));
+    }
 
     byQid.set(qid, {
       qid,
@@ -135,7 +180,12 @@ async function runSparql(query: string): Promise<UniversityCandidate[]> {
     });
   }
 
-  return Array.from(byQid.values());
+  // Порядок: известные вузы выше малоизвестных. У Wikidata нет ранжирования выдачи,
+  // поэтому без этой сортировки первым оказывается тот, чьё название совпало по
+  // буквам, а не тот, кого искали.
+  return Array.from(byQid.values()).sort(
+    (a, b) => (sitelinksByQid.get(b.qid) ?? 0) - (sitelinksByQid.get(a.qid) ?? 0),
+  );
 }
 
 /**
@@ -147,24 +197,28 @@ export async function resolveUniversity(search: string): Promise<UniversityCandi
   const trimmed = search.trim();
   if (!trimmed) return [];
 
+  const langs = languageOrder(trimmed);
   let sparqlFailed = false;
-  for (const lang of ["ru", "en", "kk"] as const) {
+  for (const lang of langs) {
     try {
       const candidates = await runSparql(buildSearchQuery(trimmed, lang));
       if (candidates.length > 0) return candidates;
     } catch (e) {
       sparqlFailed = true;
       console.error(`resolveUniversity: SPARQL lang=${lang} failed`, e);
-      break; // сервис лежит — перебирать языки бессмысленно, сразу к запасному пути
+      // Раньше здесь стоял break: сбой ОДНОГО языка (429, таймаут) обрывал перебор
+      // остальных и сразу уводил на Action API для всех трёх языков сразу. Один
+      // подвисший запрос на "ru" не должен мешать заведомо рабочей попытке на "en" —
+      // поэтому теперь просто идём дальше по списку.
     }
   }
 
-  // SPARQL вернул пустой результат по всем языкам — вуза действительно нет.
+  // Все языки опрошены SPARQL-ом. Ни один не упал — вуза действительно нет.
   if (!sparqlFailed) return [];
 
-  // Сервис не ответил: пробуем Action API — те же данные, другие лимиты.
+  // Хотя бы один язык не ответил: пробуем Action API, в том же порядке языков.
   try {
-    return await resolveUniversityViaApi(trimmed, USER_AGENT);
+    return await resolveUniversityViaApi(trimmed, USER_AGENT, langs);
   } catch (e) {
     throw new WikidataUnavailableError(
       `Wikidata не отвечает: SPARQL и Action API недоступны (${(e as Error).message})`,

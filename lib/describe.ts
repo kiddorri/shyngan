@@ -3,7 +3,7 @@
 // карточка Wikidata, покрытие по категориям, подписи vision к подтверждённым снимкам.
 // Никакой генерации фактов: если чего-то нет в данных, этого нет и в тексте.
 
-import { CATEGORY_LABELS, type Anchor, type CategoryCoverage, type PhotoItem, type UniversityCandidate } from "./types";
+import { CATEGORY_LABELS, type Anchor, type CategoryCoverage, type CityCenter, type PhotoItem, type UniversityCandidate } from "./types";
 
 function hostOf(url: string | null): string | null {
   if (!url) return null;
@@ -19,6 +19,7 @@ export function describeCampus(
   anchor: Anchor | null,
   photos: PhotoItem[],
   coverage: CategoryCoverage[],
+  cityCenter: CityCenter | null,
 ): string {
   const parts: string[] = [];
 
@@ -55,6 +56,12 @@ export function describeCampus(
     parts.push("Координат в Wikidata нет; расположение подтверждено совпадением Google Places и 2ГИС.");
   } else if (anchor?.source === "places") {
     parts.push("Координат в Wikidata нет; расположение известно только по Google Places, поэтому доверие понижено.");
+  }
+
+  // Расстояние до центра города — измеренная величина, а не оценка «близко к центру».
+  if (cityCenter) {
+    const km = (cityCenter.distanceM / 1000).toFixed(1);
+    parts.push(`До центра города (${cityCenter.name}) — ${km} км по данным OpenStreetMap.`);
   }
 
   const host = hostOf(university.officialWebsite);

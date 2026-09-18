@@ -5,6 +5,8 @@
 //   3) getPhotoUri      — GET  https://places.googleapis.com/v1/{photo.name}/media?skipHttpRedirect=true
 // Ничего другого из Places не используется.
 
+import type { PlaceReview } from "./types";
+
 const PLACES_BASE = "https://places.googleapis.com/v1";
 const REQUEST_TIMEOUT_MS = 8000;
 
@@ -13,6 +15,9 @@ const PLACE_FIELDS = [
   "id",
   "displayName",
   "formattedAddress",
+  // Структурный адрес: из него берётся город. Сравнивать города по строке адреса
+  // нельзя — «Алматы» в адресе и «Алма-Ата» в справочнике это один город.
+  "addressComponents",
   "location",
   "photos",
   "googleMapsUri",
@@ -43,10 +48,17 @@ export type PlacePhoto = {
   }>;
 };
 
+export type AddressComponent = {
+  longText?: string;
+  shortText?: string;
+  types?: string[];
+};
+
 export type Place = {
   id: string;
   displayName?: { text: string; languageCode?: string };
   formattedAddress?: string;
+  addressComponents?: AddressComponent[];
   location?: { latitude: number; longitude: number };
   photos?: PlacePhoto[];
   googleMapsUri?: string;
@@ -136,6 +148,54 @@ export async function getPlaceDetails(placeId: string): Promise<Place | null> {
 
   // Ответ — сам объект Place, без обёртки.
   return (await res.json()) as Place;
+}
+
+/**
+ * Отзывы о месте. Отдельный вызов с минимальной маской полей: поле reviews в Places
+ * тарифицируется по более дорогому SKU, чем остальная карточка, поэтому оно
+ * запрашивается один раз для кампуса, а не для каждого места.
+ *
+ * Пустой массив — отзывов нет либо запрос не удался: отзывы украшают профиль, но
+ * ронять из-за них сборку нельзя.
+ */
+export async function getPlaceReviews(placeId: string, limit = 5): Promise<PlaceReview[]> {
+  const url = `${PLACES_BASE}/places/${encodeURIComponent(placeId)}?languageCode=ru`;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "X-Goog-Api-Key": apiKey(),
+        "X-Goog-FieldMask": "reviews",
+      },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!res.ok) return [];
+    const json = (await res.json()) as {
+      reviews?: Array<{
+        authorAttribution?: { displayName?: string; uri?: string };
+        rating?: number;
+        text?: { text?: string; languageCode?: string };
+        originalText?: { text?: string; languageCode?: string };
+        publishTime?: string;
+      }>;
+    };
+    return (json.reviews ?? [])
+      // Свежие первыми: Places отдаёт «самые релевантные», а абитуриенту важнее
+      // недавние. Сортировать по дате разрешено — она приходит вместе с отзывом.
+      .slice()
+      .sort((a, b) => Date.parse(b.publishTime ?? "") - Date.parse(a.publishTime ?? ""))
+      .slice(0, limit)
+      .map((r) => ({
+        author: r.authorAttribution?.displayName ?? "аноним",
+        authorUri: r.authorAttribution?.uri ?? null,
+        rating: typeof r.rating === "number" ? r.rating : null,
+        text: (r.text?.text ?? r.originalText?.text ?? "").trim(),
+        publishedAt: r.publishTime ?? null,
+        languageCode: r.text?.languageCode ?? r.originalText?.languageCode ?? null,
+      }))
+      .filter((r) => r.text.length > 0);
+  } catch {
+    return [];
+  }
 }
 
 /**

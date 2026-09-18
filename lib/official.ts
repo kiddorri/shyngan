@@ -20,24 +20,70 @@
 //
 // Честная граница: мы утверждаем «опубликовано вузом на его сайте», а не «снято вузом».
 
-const REQUEST_TIMEOUT_MS = 8000;
+/** Таймауты разные по назначению. Главная страница — единственная обязательная, ей
+ *  времени не жалко. Внутренние — приятное дополнение, и ждать каждую по восемь
+ *  секунд нельзя: их до семи, и в сумме это больше всего бюджета профиля. */
+const HOME_TIMEOUT_MS = 8000;
+const INNER_TIMEOUT_MS = 5000;
+const ROBOTS_TIMEOUT_MS = 4000;
+/** Общий потолок на чтение внутренних страниц. Дальше обход прекращается, сколько бы
+ *  страниц ни осталось: 30-секундный бюджет профиля важнее полноты обхода, а
+ *  непрочитанное честно попадает в оговорки. */
+const INNER_PAGES_BUDGET_MS = 9000;
 const MAX_HTML_BYTES = 3_000_000;
-/** Общий бюджет кандидатов. Держим прежним: больше загрузок — дольше сборка профиля. */
-const MAX_CANDIDATES = 24;
-/** Сколько внутренних страниц открываем сверх главной. */
-const MAX_INNER_PAGES = 4;
+/** Общий бюджет кандидатов. Больше загрузок — дольше сборка профиля. */
+const MAX_CANDIDATES = 32;
+/** Сколько внутренних страниц открываем сверх главной. Верхняя граница мягкая:
+ *  реальный ограничитель — потолок времени, а не это число. */
+const MAX_INNER_PAGES = 9;
+/** Сколько из них отдаём общим галереям; остальное — под разделы по категориям. */
+const MAX_GENERAL_PAGES = 3;
+/** Страниц новостей и событий: у них есть дата публикации, которой больше взять негде. */
+const MAX_NEWS_PAGES = 3;
+/** Быстрый взгляд читает главную и максимум одну страницу: он должен быть быстрым. */
+const MAX_QUICK_INNER_PAGES = 1;
+/** Сколько страниц сайта запрашиваем одновременно: у вузовских серверов бывает
+ *  немного ресурсов, и восемь одновременных запросов — заметная для них нагрузка.
+ *  Три — компромисс между вежливостью и числом последовательных кругов ожидания. */
+const PAGE_CONCURRENCY = 3;
+/** Сколько времени готовы потратить на паузы, если сайт задал Crawl-delay.
+ *  Дальше этого лимита внутренние страницы просто не читаются: 30-секундный бюджет
+ *  профиля важнее, а пауза, которую попросил сайт, не обсуждается. */
+const CRAWL_DELAY_BUDGET_MS = 6000;
+const MAX_ROBOTS_BYTES = 200_000;
 
 export type OfficialCandidate = {
   url: string;
   pageUrl: string;
+  /** Дата публикации СТРАНИЦЫ, на которой лежит снимок, если страница её сообщает.
+   *  Это единственный источник настоящей даты во всём проекте: ни Google Places, ни
+   *  главные страницы сайтов дат не отдают. Про сам кадр она говорит только одно —
+   *  он опубликован не позже этой даты; когда он снят, страница не сообщает. */
+  publishedAt: string | null;
 };
 
 export type OfficialResult = {
   candidates: OfficialCandidate[];
   /** Страницы, которые удалось прочитать: главная и внутренние. */
   pagesVisited: string[];
+  /** Адреса, которые не читались, потому что их закрывает robots.txt сайта. */
+  blockedByRobots: string[];
+  /** Что известно про robots.txt сайта: прочитан, отсутствует, недоступен. */
+  robotsNote: string | null;
+  /** Сколько разделов не прочитано из-за потолка времени на обход. */
+  skippedForTime: number;
   /** null — сайт открылся; иначе причина, почему сбор не удался. */
   error: string | null;
+};
+
+/** Правила из robots.txt для нашего агента. */
+type RobotsRules = {
+  allow: string[];
+  disallow: string[];
+  /** Crawl-delay в миллисекундах, если сайт его указал. */
+  crawlDelayMs: number | null;
+  /** Как получены правила — от этого зависит текст оговорки. */
+  source: "file" | "missing" | "unreadable";
 };
 
 const SKIP_EXT = /\.(svg|gif|ico|bmp|css|js|woff2?|ttf|eot|mp4|webm|pdf)(\?|#|$)/i;
@@ -47,15 +93,38 @@ const SKIP_EXT = /\.(svg|gif|ico|bmp|css|js|woff2?|ttf|eot|mp4|webm|pdf)(\?|#|$)
  *  поэтому виртуальные туры ищем только полными словами. */
 const LINK_TIERS: Array<{ score: number; re: RegExp }> = [
   // Прямые указания на фотографии: галереи, альбомы, фотоотчёты, панорамные туры.
-  { score: 3, re: /галере|фотоальбом|фотоотч|фотохрон|альбом|gallery|photoalbum|photos?\b|album|виртуальн|virtual.?tour|3d.?tour|3d.?тур|панорам|panorama/i },
+  { score: 3, re: /галере|фотоальбом|фотоотч|фотохрон|альбом|gallery|photoalbum|photos?\b|album|виртуальн|virtual.?tour|3d.?tour|3d.?тур|панорам|panorama|фотосурет|суреттер|галерея/i },
   // Разделы про сами объекты вуза: там фотографии чаще всего есть.
-  { score: 2, re: /кампус|campus|студгородок|общежит|dormitor|hostel|библиотек|librar|лаборатор|laborator|инфраструктур|facilities/i },
+  { score: 2, re: /кампус|campus|студгородок|общежит|dormitor|hostel|библиотек|librar|лаборатор|laborator|инфраструктур|facilities|кітапхана|жатақхана|зертхана|асхана|спорт/i },
   // Слабый признак: раздел может оказаться текстовым (новости конференций, объявления).
   { score: 1, re: /студенческ|студентам|жизнь|student.?life|медиа|media/i },
 ];
 
 /** Разделы, где фотографий заведомо нет — не тратим на них запрос. */
-const SKIP_LINK = /контакт|ваканс|приём|priem|admission|документ|закуп|тендер|новост|news|login|search|\.pdf|\.docx?|\.xlsx?/i;
+const SKIP_LINK = /контакт|ваканс|приём|priem|admission|документ|закуп|тендер|login|search|\.pdf|\.docx?|\.xlsx?/i;
+
+/** Страницы событий и новостей. Раньше они отбрасывались как «текст без фотографий»,
+ *  и это стоило нам дат: у новости дата публикации есть в разметке, а у галереи её
+ *  нет никогда. Плюс новость показывает вуз сегодняшний, а не десятилетней давности. */
+const NEWS_LINK = /новост|жаңалық|news|событи|іс-шара|мероприят|events?\b/i;
+/** Адрес с годом — почти всегда отдельная новость, а не её список. */
+const DATED_URL = /\/20\d\d[/-]/;
+
+/** Разделы под конкретные категории профиля. Общая галерея у вуза одна и часто
+ *  состоит из фасадов; снимки библиотеки, спортзала и столовой лежат в своих
+ *  разделах, и без отдельного запроса до них дело не доходит.
+ *
+ *  Это выбор СТРАНИЦЫ, а не категории снимка: что изображено на найденных
+ *  фотографиях, по-прежнему решает модель, а не текст ссылки. Раздел «Библиотека»
+ *  вполне может оказаться списком электронных баз без единой фотографии. */
+const CATEGORY_LINKS: Array<{ key: string; re: RegExp }> = [
+  { key: "library", re: /библиотек|кітапхана|kitapkhana|librar/i },
+  { key: "sport", re: /спорт|спорткомплекс|бассейн|стадион|sport|gym|stadium/i },
+  { key: "dorm", re: /общежит|жатақхана|zhatakhana|dormitor|hostel/i },
+  { key: "lab", re: /лаборатор|laborator/i },
+  { key: "canteen", re: /столов|асхана|ashana|буфет|canteen|cafeteria|dining/i },
+  { key: "lecture", re: /аудитори|учебн.{0,3}корпус|лекцион|classroom|lecture.?hall/i },
+];
 
 function linkScore(haystack: string): number {
   for (const tier of LINK_TIERS) if (tier.re.test(haystack)) return tier.score;
@@ -119,11 +188,13 @@ function extractImageUrls(html: string, pageUrl: string): string[] {
   return found;
 }
 
-/** Внутренние ссылки того же домена, за которыми вероятны фотографии.
- *  Возвращаются в порядке убывания ранга; при равном ранге — в порядке появления. */
-function extractGalleryLinks(html: string, pageUrl: string): string[] {
+type SiteLink = { url: string; haystack: string };
+
+/** Все внутренние ссылки страницы одним проходом: адрес плюс текст ссылки,
+ *  по которому дальше решается, за чем эта ссылка ведёт. */
+function extractLinks(html: string, pageUrl: string): SiteLink[] {
   const origin = new URL(pageUrl).origin;
-  const out: Array<{ url: string; score: number }> = [];
+  const out: SiteLink[] = [];
   const seen = new Set<string>();
 
   for (const m of html.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,120}?)<\/a>/gi)) {
@@ -131,8 +202,6 @@ function extractGalleryLinks(html: string, pageUrl: string): string[] {
     const text = m[2].replace(/<[^>]*>/g, " ");
     const haystack = `${href} ${text}`;
     if (SKIP_LINK.test(haystack)) continue;
-    const score = linkScore(haystack);
-    if (score === 0) continue;
     try {
       const abs = new URL(href, pageUrl);
       if (abs.origin !== origin) continue;
@@ -140,19 +209,195 @@ function extractGalleryLinks(html: string, pageUrl: string): string[] {
       const key = abs.toString();
       if (key === pageUrl || seen.has(key)) continue;
       seen.add(key);
-      out.push({ url: key, score });
+      out.push({ url: key, haystack });
     } catch {
       /* невалидная ссылка */
     }
   }
+  return out;
+}
 
-  // Array.prototype.sort стабилен: страницы одного ранга сохраняют порядок вёрстки.
-  return out.sort((a, b) => b.score - a.score).map((l) => l.url);
+/**
+ * Какие внутренние страницы открыть. Бюджет делится на две части.
+ *
+ * Сначала общие галереи — по убыванию ранга ссылки: там лежит основная масса
+ * снимков. Затем по одной странице на категорию: библиотека, спорт, общежитие,
+ * лаборатории, столовая, аудитории. Без второй части обход упирался в фасады —
+ * общая галерея вуза почти всегда состоит из видов главного корпуса.
+ *
+ * Порядок внутри категорий — порядок списка CATEGORY_LINKS, а не вёрстки:
+ * при нехватке бюджета отбрасываются последние, а не случайные.
+ */
+function selectInnerLinks(html: string, pageUrl: string, deep: boolean): string[] {
+  const links = extractLinks(html, pageUrl);
+
+  const general = links
+    .map((l) => ({ url: l.url, score: linkScore(l.haystack) }))
+    .filter((l) => l.score > 0)
+    // Array.prototype.sort стабилен: страницы одного ранга сохраняют порядок вёрстки.
+    .sort((a, b) => b.score - a.score)
+    .map((l) => l.url);
+
+  const picked: string[] = [];
+  const seen = new Set<string>();
+  const take = (url: string) => {
+    if (seen.has(url) || picked.length >= MAX_INNER_PAGES) return;
+    seen.add(url);
+    picked.push(url);
+  };
+
+  if (!deep) {
+    // Быстрый взгляд: одна страница сверх главной, и только самая явная галерея.
+    for (const url of general.slice(0, 1)) take(url);
+    return picked.slice(0, MAX_QUICK_INNER_PAGES);
+  }
+
+  for (const url of general.slice(0, MAX_GENERAL_PAGES)) take(url);
+  for (const { re } of CATEGORY_LINKS) {
+    const hit = links.find((l) => re.test(l.haystack) && !seen.has(l.url));
+    if (hit) take(hit.url);
+  }
+  // Свежие материалы: сначала отдельные новости (в адресе есть год), потом разделы
+  // новостей и событий. Ради даты публикации и ради сегодняшнего вида кампуса.
+  const news = links.filter((l) => NEWS_LINK.test(l.haystack) || DATED_URL.test(l.url));
+  for (const l of news.filter((x) => DATED_URL.test(x.url)).slice(0, MAX_NEWS_PAGES)) take(l.url);
+  for (const l of news.slice(0, MAX_NEWS_PAGES)) take(l.url);
+  // Остаток бюджета — обратно общим галереям, если категорийных разделов на сайте нет.
+  for (const url of general) take(url);
+
+  return picked;
+}
+
+// ---- robots.txt ----
+//
+// Файл в корне сайта, которым владелец сообщает автоматическим программам, какие
+// разделы читать не нужно. Юридической силы у него нет, но это общепринятая
+// договорённость, и сервис, который построен на добросовестности, обязан её
+// соблюдать. Пропущенные из-за него адреса показываются в оговорках профиля:
+// «не нашли» и «не смотрели, потому что попросили не смотреть» — разные ответы.
+
+/** Токен нашего агента из User-Agent: «shyngan/0.2 (…)» → «shyngan». */
+function agentToken(userAgent: string): string {
+  return (userAgent.split("/")[0] ?? userAgent).trim().toLowerCase();
+}
+
+/**
+ * Разбор robots.txt. Берём группу для нашего агента, если она есть, иначе группу
+ * «User-agent: *». Остальные группы адресованы не нам.
+ */
+function parseRobots(text: string, token: string): Omit<RobotsRules, "source"> {
+  const groups = new Map<string, { allow: string[]; disallow: string[]; crawlDelayMs: number | null }>();
+  let current: string[] = [];
+  let sawRuleInGroup = false;
+
+  const groupFor = (agent: string) => {
+    let g = groups.get(agent);
+    if (!g) {
+      g = { allow: [], disallow: [], crawlDelayMs: null };
+      groups.set(agent, g);
+    }
+    return g;
+  };
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/#.*$/, "").trim();
+    if (!line) continue;
+    const idx = line.indexOf(":");
+    if (idx < 0) continue;
+    const field = line.slice(0, idx).trim().toLowerCase();
+    const value = line.slice(idx + 1).trim();
+
+    if (field === "user-agent") {
+      // Подряд идущие User-agent относятся к одной группе правил.
+      if (sawRuleInGroup) {
+        current = [];
+        sawRuleInGroup = false;
+      }
+      current.push(value.toLowerCase());
+      groupFor(value.toLowerCase());
+      continue;
+    }
+    if (current.length === 0) continue;
+
+    if (field === "disallow" || field === "allow") {
+      sawRuleInGroup = true;
+      for (const agent of current) {
+        // Пустой Disallow означает «ничего не запрещено» — не правило, а его отсутствие.
+        if (value === "") continue;
+        groupFor(agent)[field === "allow" ? "allow" : "disallow"].push(value);
+      }
+    } else if (field === "crawl-delay") {
+      sawRuleInGroup = true;
+      const seconds = Number.parseFloat(value.replace(",", "."));
+      if (Number.isFinite(seconds) && seconds > 0) {
+        for (const agent of current) groupFor(agent).crawlDelayMs = Math.round(seconds * 1000);
+      }
+    }
+  }
+
+  const mine = groups.get(token) ?? groups.get("*");
+  return mine ?? { allow: [], disallow: [], crawlDelayMs: null };
+}
+
+async function fetchRobots(origin: string, userAgent: string): Promise<RobotsRules> {
+  try {
+    const res = await fetch(`${origin}/robots.txt`, {
+      headers: { "User-Agent": userAgent, Accept: "text/plain" },
+      signal: AbortSignal.timeout(ROBOTS_TIMEOUT_MS),
+      redirect: "follow",
+    });
+    // 404 и прочие 4xx означают «правил нет» — это штатный ответ, а не сбой.
+    if (res.status >= 400 && res.status < 500) {
+      return { allow: [], disallow: [], crawlDelayMs: null, source: "missing" };
+    }
+    if (!res.ok) return { allow: [], disallow: [], crawlDelayMs: null, source: "unreadable" };
+    const text = (await res.text()).slice(0, MAX_ROBOTS_BYTES);
+    return { ...parseRobots(text, agentToken(userAgent)), source: "file" };
+  } catch {
+    return { allow: [], disallow: [], crawlDelayMs: null, source: "unreadable" };
+  }
+}
+
+/** Шаблон пути из robots.txt в регулярное выражение: поддерживаются * и завершающий $. */
+function robotsPatternToRegExp(pattern: string): RegExp {
+  let out = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "*") out += ".*";
+    else if (ch === "$" && i === pattern.length - 1) out += "$";
+    else out += ch.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp("^" + out);
+}
+
+function matchLength(pattern: string, path: string): number {
+  return robotsPatternToRegExp(pattern).test(path) ? pattern.replace(/[*$]/g, "").length : -1;
+}
+
+/**
+ * Разрешает ли robots.txt читать этот адрес. Правило с более длинным совпадением
+ * побеждает; при равной длине выигрывает Allow — так это работает у поисковиков.
+ */
+function isAllowedByRobots(rules: RobotsRules, url: string): boolean {
+  if (rules.disallow.length === 0) return true;
+  let path: string;
+  try {
+    const u = new URL(url);
+    path = u.pathname + u.search;
+  } catch {
+    return true;
+  }
+  let bestAllow = -1;
+  let bestDisallow = -1;
+  for (const p of rules.allow) bestAllow = Math.max(bestAllow, matchLength(p, path));
+  for (const p of rules.disallow) bestDisallow = Math.max(bestDisallow, matchLength(p, path));
+  if (bestDisallow < 0) return true;
+  return bestAllow >= bestDisallow;
 }
 
 type FetchedPage = { url: string; html: string };
 
-async function fetchPage(url: string, userAgent: string): Promise<FetchedPage | { error: string }> {
+async function fetchPage(url: string, userAgent: string, timeoutMs: number): Promise<FetchedPage | { error: string }> {
   try {
     const res = await fetch(url, {
       headers: {
@@ -160,7 +405,7 @@ async function fetchPage(url: string, userAgent: string): Promise<FetchedPage | 
         Accept: "text/html,application/xhtml+xml",
         "Accept-Language": "ru,kk,en",
       },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
       redirect: "follow",
     });
     if (!res.ok) return { error: `сайт ответил HTTP ${res.status}` };
@@ -183,37 +428,118 @@ async function fetchPage(url: string, userAgent: string): Promise<FetchedPage | 
   }
 }
 
+/**
+ * Дата публикации страницы. Три источника по убыванию надёжности: разметка статьи,
+ * элемент <time datetime>, год и месяц в адресе. Всё это опубликованные данные, а не
+ * догадка: если ничего нет — null, и профиль честно пишет «дата неизвестна».
+ */
+export function pageDate(html: string, pageUrl: string): string | null {
+  const meta = html.match(/<meta[^>]+property=["'](?:article:published_time|article:modified_time)["'][^>]*content=["']([^"']+)["']/i)
+    ?? html.match(/<meta[^>]+content=["']([^"']+)["'][^>]*property=["']article:published_time["']/i);
+  const iso = meta?.[1] ?? html.match(/<time[^>]+datetime=["']([^"']+)["']/i)?.[1];
+  if (iso) {
+    const d = new Date(iso);
+    if (!Number.isNaN(d.getTime()) && d.getFullYear() > 1990) return d.toISOString();
+  }
+  // Адреса вида /news/2026/03/12/ или /2026-03-12-den-otkrytyh-dverej
+  const fromUrl = pageUrl.match(/(?:^|[/\-])(20\d\d)[/\-](\d{1,2})(?:[/\-](\d{1,2}))?(?:[/\-]|$)/);
+  if (fromUrl) {
+    const [, y, m, day] = fromUrl;
+    const d = new Date(Date.UTC(Number(y), Number(m) - 1, Number(day ?? 1)));
+    if (!Number.isNaN(d.getTime()) && d.getUTCFullYear() >= 2000 && Number(m) >= 1 && Number(m) <= 12) {
+      return d.toISOString();
+    }
+  }
+  return null;
+}
+
 export async function collectOfficialImages(
   officialWebsite: string,
   userAgent: string,
+  opts: { deep: boolean; maxCandidates?: number } = { deep: true },
 ): Promise<OfficialResult> {
   let homeUrl: string;
+  let origin: string;
   try {
-    homeUrl = new URL(officialWebsite).toString();
+    const parsed = new URL(officialWebsite);
+    homeUrl = parsed.toString();
+    origin = parsed.origin;
   } catch {
-    return { candidates: [], pagesVisited: [], error: "некорректный адрес официального сайта" };
+    return { candidates: [], pagesVisited: [], blockedByRobots: [], robotsNote: null, skippedForTime: 0, error: "некорректный адрес официального сайта" };
   }
 
-  const home = await fetchPage(homeUrl, userAgent);
-  if ("error" in home) return { candidates: [], pagesVisited: [], error: home.error };
+  // robots.txt читаем ДО первой страницы: спрашивать разрешение после того, как уже
+  // зашёл, смысла не имеет.
+  const robots = await fetchRobots(origin, userAgent);
+  const robotsNote =
+    robots.source === "missing"
+      ? "robots.txt на сайте нет — ограничений для обхода не заявлено"
+      : robots.source === "unreadable"
+        ? "robots.txt прочитать не удалось; обход выполнен по общим правилам вежливости"
+        : robots.disallow.length > 0
+          ? `robots.txt прочитан: ${robots.disallow.length} запрещённых раздел(ов)${robots.crawlDelayMs ? `, Crawl-delay ${robots.crawlDelayMs / 1000} с` : ""}`
+          : "robots.txt прочитан: запретов для нашего агента нет";
+  const blockedByRobots: string[] = [];
+
+  if (!isAllowedByRobots(robots, homeUrl)) {
+    return {
+      candidates: [],
+      pagesVisited: [],
+      blockedByRobots: [homeUrl],
+      robotsNote,
+      skippedForTime: 0,
+      error: "robots.txt сайта запрещает автоматическое чтение главной страницы — обход не выполнялся",
+    };
+  }
+
+  const home = await fetchPage(homeUrl, userAgent, HOME_TIMEOUT_MS);
+  if ("error" in home) return { candidates: [], pagesVisited: [], blockedByRobots, robotsNote, skippedForTime: 0, error: home.error };
 
   const pages: FetchedPage[] = [home];
 
-  // Внутренние страницы с галереями — параллельно, ошибки отдельных страниц не важны.
-  const links = extractGalleryLinks(home.html, home.url).slice(0, MAX_INNER_PAGES);
-  if (links.length > 0) {
-    const inner = await Promise.all(links.map((l) => fetchPage(l, userAgent)));
-    for (const page of inner) if (!("error" in page)) pages.push(page);
+  // Внутренние страницы: сначала отбрасываем закрытые в robots.txt, затем читаем
+  // небольшими группами, а если сайт просил паузу — по одной с этой паузой.
+  const selected = selectInnerLinks(home.html, home.url, opts.deep);
+  const links: string[] = [];
+  for (const l of selected) {
+    if (isAllowedByRobots(robots, l)) links.push(l);
+    else blockedByRobots.push(l);
+  }
+
+  const delay = robots.crawlDelayMs ?? 0;
+  const allowedByBudget = delay > 0 ? Math.max(0, Math.floor(CRAWL_DELAY_BUDGET_MS / delay)) : links.length;
+  const toVisit = links.slice(0, allowedByBudget);
+  const batchSize = delay > 0 ? 1 : PAGE_CONCURRENCY;
+
+  // Часы включаются здесь: медленный сайт не должен утащить за собой весь профиль.
+  const startedAt = Date.now();
+  let skippedForTime = 0;
+  for (let i = 0; i < toVisit.length; i += batchSize) {
+    if (Date.now() - startedAt > INNER_PAGES_BUDGET_MS) {
+      skippedForTime = toVisit.length - i;
+      break;
+    }
+    if (delay > 0 && i > 0) await new Promise((r) => setTimeout(r, delay));
+    const batch = await Promise.all(toVisit.slice(i, i + batchSize).map((l) => fetchPage(l, userAgent, INNER_TIMEOUT_MS)));
+    for (const page of batch) if (!("error" in page)) pages.push(page);
   }
 
   // Бюджет кандидатов делим между страницами по кругу. Иначе баннеры и иконки главной
   // занимают его целиком, и до галереи, ради которой обход и затевался, дело не доходит.
-  const perPage = pages.map((page) =>
-    extractImageUrls(page.html, page.url).map((url) => ({ url, pageUrl: page.url })),
-  );
+  // Правила robots.txt распространяются и на сами файлы картинок этого домена.
+  // Картинки со сторонних хостов (CDN) ими не управляются: у того домена свой файл.
+  const perPage = pages.map((page) => {
+    const published = pageDate(page.html, page.url);
+    return extractImageUrls(page.html, page.url)
+      .filter((url) => !url.startsWith(origin) || isAllowedByRobots(robots, url))
+      .map((url) => ({ url, pageUrl: page.url, publishedAt: published }));
+  });
   const seen = new Set<string>();
   const candidates: OfficialCandidate[] = [];
-  for (let i = 0; candidates.length < MAX_CANDIDATES; i++) {
+  // Кандидатов набираем ровно столько, сколько профиль способен использовать: каждый
+  // лишний — это скачанный и выброшенный файл, то есть потраченные секунды.
+  const budget = Math.max(1, opts.maxCandidates ?? MAX_CANDIDATES);
+  for (let i = 0; candidates.length < budget; i++) {
     let anyLeft = false;
     for (const list of perPage) {
       const item = list[i];
@@ -222,14 +548,21 @@ export async function collectOfficialImages(
       if (seen.has(item.url)) continue;
       seen.add(item.url);
       candidates.push(item);
-      if (candidates.length >= MAX_CANDIDATES) break;
+      if (candidates.length >= budget) break;
     }
     if (!anyLeft) break;
   }
 
   const pagesVisited = pages.map((p) => p.url);
   if (candidates.length === 0) {
-    return { candidates: [], pagesVisited, error: "на сайте не найдено изображений (возможно, страница рендерится скриптом)" };
+    return {
+      candidates: [],
+      pagesVisited,
+      blockedByRobots,
+      robotsNote,
+      skippedForTime,
+      error: "на сайте не найдено изображений (возможно, страница рендерится скриптом)",
+    };
   }
-  return { candidates, pagesVisited, error: null };
+  return { candidates, pagesVisited, blockedByRobots, robotsNote, skippedForTime, error: null };
 }

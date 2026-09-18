@@ -4,6 +4,18 @@
 
 export type TrustTier = "verified" | "probable" | "unverified";
 
+/** Режим сборки профиля.
+ *  quick — быстрый взгляд: по одному-двум снимкам на категорию, только главная
+ *  страница сайта, укороченный план запросов. Задача — показать вуз целиком и сразу.
+ *  deep — полный сбор по запросу пользователя: больше запросов, глубокий обход
+ *  сайта, больше снимков в каждой категории. Разделение нужно, чтобы не тратить
+ *  время и квоты на тех, кому хватило первого взгляда. */
+export type ProfileMode = "quick" | "deep";
+
+/** «city» и «citywide» — разные вещи, и путать их нельзя.
+ *  city — то, до чего студент дойдёт пешком от кампуса (кейс: окружение).
+ *  citywide — сам город, в котором расположен вуз (кейс, требование 2).
+ *  Модель различить их не может: на снимке улица и там, и там. Разделяет география. */
 export type Category =
   | "campus"
   | "lecture"
@@ -12,7 +24,8 @@ export type Category =
   | "lab"
   | "sport"
   | "life"
-  | "city";
+  | "city"
+  | "citywide";
 
 export const CATEGORY_LABELS: Record<Category, string> = {
   campus: "Кампус",
@@ -23,9 +36,10 @@ export const CATEGORY_LABELS: Record<Category, string> = {
   sport: "Спорт",
   life: "Студенческая жизнь",
   city: "Вокруг кампуса",
+  citywide: "Город",
 };
 
-export const ALL_CATEGORIES: Category[] = ["campus", "lecture", "dorm", "library", "lab", "sport", "life", "city"];
+export const ALL_CATEGORIES: Category[] = ["campus", "lecture", "dorm", "library", "lab", "sport", "life", "city", "citywide"];
 
 /** Откуда снимок. official_site — опубликован на сайте вуза; google_places — загружен посетителем. */
 export type PhotoSource = "google_places" | "official_site";
@@ -70,6 +84,9 @@ export type VisionVerdict = {
   category: Category | "other";
   caption: string;
   confidence: "high" | "medium" | "low";
+  /** Общий вид (панорама, перспектива улицы, силуэт города) против крупного плана.
+   *  Нужно для категории «Город»: город показывают панорамой, а не киоском в городе. */
+  wideView: boolean;
 };
 
 export type Evidence = {
@@ -96,8 +113,11 @@ export type PhotoItem = {
   /** Кликабельный источник: страница места в Google Maps или страница сайта вуза. */
   sourceUrl: string | null;
   attribution: Attribution[];
-  /** Ни Places, ни главная страница сайта не отдают дату публикации — всегда null. Не выдумывать. */
-  publishedAt: null;
+  /** Дата публикации, если источник её сообщил. У Google Places её нет никогда.
+   *  У снимков со страниц новостей и событий вуза она есть: берётся из разметки
+   *  страницы (article:published_time, <time datetime>) или из адреса вида
+   *  /news/2026/03/. Не выдумывать: если источник молчит — null. */
+  publishedAt: string | null;
   /** Момент получения снимка (ISO). Требование 6 кейса допускает дату публикации ИЛИ получения. */
   retrievedAt: string;
   category: Category;
@@ -121,6 +141,16 @@ export type RemovalStats = {
   irrelevant: number;
   tooSmall: number;
   failedDownload: number;
+  /** Загрузились, но не поместились в лимит снимков с одного сайта вуза. */
+  overSiteLimit: number;
+  /** Окружение кампуса дальше порога пешей доступности — это уже другой район города. */
+  farFromCampus: number;
+  /** Резкость ниже порога: рассматривать в кадре нечего. */
+  blurry: number;
+  /** Сверх потолка на категорию — чтобы одно здание с разных сторон её не занимало. */
+  overCategoryLimit: number;
+  /** Кадры города, оказавшиеся крупным планом: город показывают общим видом. */
+  cityNotWide: number;
 };
 
 export type Anchor = {
@@ -129,18 +159,67 @@ export type Anchor = {
   source: Exclude<AnchorSource, "none">;
 };
 
+/** Центр города по данным OpenStreetMap (Nominatim). Нужен для расстояния «кампус —
+ *  центр города» из дополнительных функций кейса. Лицензия ODbL требует атрибуции,
+ *  поэтому источник указан прямо в типе и показывается в интерфейсе. */
+export type CityCenter = {
+  name: string;
+  lat: number;
+  lon: number;
+  /** Расстояние от якоря кампуса до центра города. */
+  distanceM: number;
+  source: "openstreetmap";
+};
+
+/** Точка на плане кампуса: место, которое дало снимки, с измеренным расстоянием. */
+export type MapPoint = {
+  placeId: string;
+  name: string;
+  lat: number;
+  lon: number;
+  distanceM: number;
+  category: Category;
+  photos: number;
+};
+
+/** Отзыв о месте из Google Places.
+ *  Это отзывы посетителей места, а не проверенных студентов: платформа не сообщает,
+ *  кем является автор, и выдавать их за студенческие нельзя. Зато у них есть то,
+ *  чего нет у фотографий, — настоящая дата публикации. */
+export type PlaceReview = {
+  author: string;
+  authorUri: string | null;
+  rating: number | null;
+  text: string;
+  /** ISO-дата публикации отзыва — реальная, от платформы. */
+  publishedAt: string | null;
+  languageCode: string | null;
+};
+
 export type ProgressEvent =
   | { stage: "anchor"; source: AnchorSource }
   | { stage: "places"; found: number }
   | { stage: "official"; found: number; error: string | null }
   | { stage: "download"; total: number }
+  /** Что потерялось между загрузкой и дедупликацией: иначе «осталось N» выглядит
+   *  как результат одной проверки, хотя причин было несколько. */
+  | { stage: "prefilter"; kept: number; failedDownload: number; tooSmall: number; blurry: number; overSiteLimit: number }
   | { stage: "dedupe"; kept: number; duplicates: number }
   | { stage: "vision"; batches: number }
   | { stage: "done" };
 
 export type Profile = {
+  mode: ProfileMode;
   university: UniversityCandidate;
   anchor: Anchor | null;
+  /** null — город неизвестен или Nominatim не ответил. */
+  cityCenter: CityCenter | null;
+  /** Места, попавшие в профиль, для плана кампуса. Пусто, если якоря нет. */
+  mapPoints: MapPoint[];
+  /** Отзывы о кампусе из Google Places. Пусто, если их нет или сбор отключён. */
+  reviews: PlaceReview[];
+  /** Место, к которому относятся отзывы. */
+  reviewsPlaceName: string | null;
   photos: PhotoItem[];
   coverage: CategoryCoverage[];
   /** Краткое описание кампуса, собранное только из найденных данных. */

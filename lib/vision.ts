@@ -48,6 +48,7 @@ function buildPrompt(ctx: VisionContext, count: number): string {
     `- category: exactly one of campus, lecture, dorm, library, lab, sport, life, city, other. Use "lecture" for classrooms, lecture halls and auditoriums — rooms with seating rows, desks, a board or a screen. Use "city" for the public surroundings a student would walk in — parks, squares, cafes, streets near campus — that are not university facilities themselves. Use "other" when relevant is false.`,
     `- caption: up to 8 words in Russian, a factual description of what is visible. No guesses about which university it is.`,
     `- confidence: high, medium or low — how sure you are about relevant and category.`,
+    `- wideView: true if the frame is a wide view — a city skyline, a panorama, a long street or square perspective, a group of buildings seen from a distance, a campus seen as a whole. false if it is a close-up — one object filling the frame, an interior, a sign, a statue, food, a person, a detail of a facade.`,
     ``,
     `Do not assume an image belongs to this university just because you were told the name. Judge only what is visible.`,
   ].join("\n");
@@ -63,8 +64,9 @@ const RESPONSE_SCHEMA = {
       category: { type: "STRING", enum: [...CATEGORY_ENUM] },
       caption: { type: "STRING" },
       confidence: { type: "STRING", enum: [...CONFIDENCE_ENUM] },
+      wideView: { type: "BOOLEAN" },
     },
-    required: ["index", "relevant", "category", "caption", "confidence"],
+    required: ["index", "relevant", "category", "caption", "confidence", "wideView"],
   },
 };
 
@@ -74,6 +76,7 @@ type RawVerdict = {
   category: string;
   caption: string;
   confidence: string;
+  wideView?: boolean;
 };
 
 function isCategory(s: string): s is Category | "other" {
@@ -134,6 +137,7 @@ async function classifyBatch(batch: VisionInput[], ctx: VisionContext): Promise<
       category: r.category,
       caption: String(r.caption ?? "").slice(0, 120),
       confidence: r.confidence,
+      wideView: Boolean(r.wideView),
     });
   }
   return out;
