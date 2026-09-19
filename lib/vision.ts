@@ -13,10 +13,10 @@ const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMI
 /** Экспортируется, чтобы прогресс показывал настоящее число запросов к модели. */
 export const BATCH_SIZE = 4;
 /** Сколько батчей отправляем одновременно. Пять укладывается в лимиты платного тира. */
-const CONCURRENCY = 5;
+const CONCURRENCY = 3;
 const REQUEST_TIMEOUT_MS = 30000;
 
-const CATEGORY_ENUM = ["campus", "lecture", "dorm", "library", "lab", "sport", "life", "city", "other"] as const;
+const CATEGORY_ENUM = ["campus", "lecture", "dorm", "library", "lab", "sport", "canteen", "outdoor", "life", "city", "other"] as const;
 const CONFIDENCE_ENUM = ["high", "medium", "low"] as const;
 
 function apiKey(): string {
@@ -44,8 +44,8 @@ function buildPrompt(ctx: VisionContext, count: number): string {
     ``,
     `For EACH image return one entry with:`,
     `- index: the image number (1-based, in the order given).`,
-    `- relevant: true if the image plausibly shows a university facility (building, campus grounds, dormitory, library, laboratory, sports facility, lecture hall), campus student life (events, students on campus), or the public surroundings near a campus (park, square, cafe, street). false for logos, documents, screenshots, text-only graphics, food close-ups, selfies without campus context, unrelated interiors, promotional collages, maps.`,
-    `- category: exactly one of campus, lecture, dorm, library, lab, sport, life, city, other. Use "lecture" for classrooms, lecture halls and auditoriums — rooms with seating rows, desks, a board or a screen. Use "city" for the public surroundings a student would walk in — parks, squares, cafes, streets near campus — that are not university facilities themselves. Use "other" when relevant is false.`,
+    `- relevant: true if the image plausibly shows a university facility (building, campus grounds, dormitory, library, laboratory, sports facility, lecture hall, canteen), campus student life (events, students on campus), or the public surroundings near a campus (park, square, cafe, street). false for logos, documents, screenshots, text-only graphics, food close-ups, selfies without campus context, unrelated interiors, promotional collages, maps.`,
+    `- category: exactly one of campus, lecture, dorm, library, lab, sport, canteen, outdoor, life, city, other. Use "canteen" for a campus cafeteria or dining hall, not for food close-ups. Use "outdoor" for university grounds, paths, green areas and courtyards; "city" for public parks or streets outside the campus. Use "lecture" for classrooms and auditoriums. Use "other" when relevant is false.`,
     `- caption: up to 8 words in Russian, a factual description of what is visible. No guesses about which university it is.`,
     `- confidence: high, medium or low — how sure you are about relevant and category.`,
     `- wideView: true if the frame is a wide view — a city skyline, a panorama, a long street or square perspective, a group of buildings seen from a distance, a campus seen as a whole. false if it is a close-up — one object filling the frame, an interior, a sign, a statue, food, a person, a detail of a facade.`,
@@ -87,7 +87,7 @@ function isConfidence(s: string): s is VisionVerdict["confidence"] {
   return (CONFIDENCE_ENUM as readonly string[]).includes(s);
 }
 
-async function classifyBatch(batch: VisionInput[], ctx: VisionContext): Promise<Map<string, VisionVerdict>> {
+async function classifyBatch(batch: VisionInput[], ctx: VisionContext, signal?: AbortSignal): Promise<Map<string, VisionVerdict>> {
   const parts: Array<Record<string, unknown>> = [{ text: buildPrompt(ctx, batch.length) }];
   batch.forEach((img, i) => {
     parts.push({ text: `Image ${i + 1}:` });
@@ -110,7 +110,7 @@ async function classifyBatch(batch: VisionInput[], ctx: VisionContext): Promise<
       "x-goog-api-key": apiKey(),
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]) : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -151,6 +151,7 @@ async function classifyBatch(batch: VisionInput[], ctx: VisionContext): Promise<
 export async function classifyImages(
   inputs: VisionInput[],
   ctx: VisionContext,
+  options: { concurrency?: number; retry?: boolean; signal?: AbortSignal } = {},
 ): Promise<{ verdicts: Map<string, VisionVerdict>; errors: string[] }> {
   const verdicts = new Map<string, VisionVerdict>();
   const errors: string[] = [];
@@ -163,26 +164,26 @@ export async function classifyImages(
 
   let cursor = 0;
   async function worker(): Promise<void> {
-    while (cursor < batches.length) {
+    while (cursor < batches.length && !options.signal?.aborted) {
       const batch = batches[cursor++];
       // Одна повторная попытка: таймаут или 429 на одном батче не должны
       // оставлять снимки без вердикта — иначе они молча теряют категорию.
       let lastError: unknown = null;
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < (options.retry === false ? 1 : 2); attempt++) {
         try {
-          const partial = await classifyBatch(batch, ctx);
+          const partial = await classifyBatch(batch, ctx, options.signal);
           partial.forEach((v, k) => verdicts.set(k, v));
           lastError = null;
           break;
         } catch (e) {
           lastError = e;
-          if (attempt === 0) await new Promise((r) => setTimeout(r, 1500));
+          if (attempt === 0 && options.retry !== false) await new Promise((r) => setTimeout(r, 1500));
         }
       }
       if (lastError) errors.push((lastError as Error).message);
     }
   }
 
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, batches.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(options.concurrency ?? CONCURRENCY, batches.length) }, worker));
   return { verdicts, errors };
 }

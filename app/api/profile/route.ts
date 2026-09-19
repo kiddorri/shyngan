@@ -4,6 +4,7 @@
 // или {"type":"error","error":"..."}.
 
 import { buildProfile } from "@/lib/profile";
+import { cachedProfile, saveProfile } from "@/lib/profile-cache";
 import { getUniversityByAnyId } from "@/lib/resolve";
 import { WikidataUnavailableError } from "@/lib/wikidata";
 import type { ProgressEvent } from "@/lib/types";
@@ -20,15 +21,27 @@ const NDJSON_HEADERS = {
 };
 
 export async function GET(req: Request): Promise<Response> {
+  const requestedAt = Date.now();
   const params = new URL(req.url).searchParams;
   const qid = params.get("qid") ?? "";
   // Быстрый взгляд — по умолчанию: он дешевле и укладывается в несколько секунд.
   // Полный сбор запускается только по явной просьбе пользователя.
   const mode = params.get("mode") === "deep" ? "deep" : "quick";
+  const clientStartedAt = Number(params.get("startedAt"));
 
   // Идентификатор вуза: QID из Wikidata либо places:<place_id> для вузов вне Wikidata.
   if (!/^Q\d+$/.test(qid) && !/^places:[\w-]+$/.test(qid)) {
     return Response.json({ error: "Параметр qid должен иметь вид Q12345 или places:<id>" }, { status: 400 });
+  }
+
+  const cached = cachedProfile(qid, mode);
+  if (cached) {
+    const profile = { ...cached.profile, timingMs: Date.now() - requestedAt, cacheAgeMs: cached.ageMs };
+    const body = [
+      JSON.stringify({ type: "university", university: profile.university }),
+      JSON.stringify({ type: "profile", ...profile }),
+    ].join("\n") + "\n";
+    return new Response(body, { headers: NDJSON_HEADERS });
   }
 
   let university;
@@ -55,7 +68,11 @@ export async function GET(req: Request): Promise<Response> {
       const send = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
       send({ type: "university", university });
       try {
-        const profile = await buildProfile(university, (e: ProgressEvent) => send({ type: "progress", ...e }), mode);
+        const elapsedSinceSearch = Number.isFinite(clientStartedAt) && clientStartedAt > 0 && clientStartedAt <= Date.now()
+          ? Date.now() - clientStartedAt : 0;
+        const quickBudgetMs = Math.max(3000, 29_000 - elapsedSinceSearch);
+        const profile = await buildProfile(university, (e: ProgressEvent) => send({ type: "progress", ...e }), mode, quickBudgetMs);
+        saveProfile(profile);
         send({ type: "profile", ...profile });
       } catch (e) {
         send({ type: "error", error: `Не удалось собрать профиль: ${(e as Error).message}` });

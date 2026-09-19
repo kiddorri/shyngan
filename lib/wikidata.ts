@@ -208,43 +208,41 @@ export async function resolveUniversity(search: string): Promise<UniversityCandi
   if (!trimmed) return [];
 
   const langs = languageOrder(trimmed);
-  let sparqlFailed = false;
-  for (const lang of langs) {
-    try {
-      const candidates = await runSparql(buildSearchQuery(trimmed, lang));
-      if (candidates.length > 0) return candidates;
-    } catch (e) {
-      sparqlFailed = true;
-      console.error(`resolveUniversity: SPARQL lang=${lang} failed`, e);
-      // Раньше здесь стоял break: сбой ОДНОГО языка (429, таймаут) обрывал перебор
-      // остальных и сразу уводил на Action API для всех трёх языков сразу. Один
-      // подвисший запрос на "ru" не должен мешать заведомо рабочей попытке на "en" —
-      // поэтому теперь просто идём дальше по списку.
-    }
-  }
-
-  // Все языки опрошены SPARQL-ом. Ни один не упал — вуза действительно нет.
-  if (!sparqlFailed) return [];
-
-  // Хотя бы один язык не ответил: пробуем Action API, в том же порядке языков.
+  // SPARQL gives the strongest type check but is frequently throttled. Action API
+  // is an independent endpoint to the same data and is usually much faster. Run
+  // both immediately: a slow SPARQL response must not consume the entire 30 s UI
+  // budget before the fallback even starts.
+  const empty = new Error("WIKIDATA_EMPTY");
+  const nonEmpty = async (work: Promise<UniversityCandidate[]>): Promise<UniversityCandidate[]> => {
+    const candidates = await work;
+    if (candidates.length === 0) throw empty;
+    return candidates;
+  };
   try {
-    return await resolveUniversityViaApi(trimmed, USER_AGENT, langs);
+    return await Promise.any([
+      nonEmpty(runSparql(buildSearchQuery(trimmed, langs[0]))),
+      nonEmpty(resolveUniversityViaApi(trimmed, USER_AGENT, langs)),
+    ]);
   } catch (e) {
+    const errors = e instanceof AggregateError ? e.errors : [e];
+    if (errors.length > 0 && errors.every((error) => error === empty)) return [];
     throw new WikidataUnavailableError(
       `Wikidata не отвечает: SPARQL и Action API недоступны (${(e as Error).message})`,
     );
   }
 }
 
-/** QID → одна карточка (для /api/profile после выбора кандидата в UI). */
+/** QID → одна карточка (для /api/profile после выбора кандидата в UI).
+ *  Для точного идентификатора Action API обычно отвечает заметно быстрее SPARQL.
+ *  Если мягкий фильтр Action API не распознал вуз, сохраняем строгий SPARQL-путь. */
 export async function getUniversityByQid(qid: string): Promise<UniversityCandidate | null> {
   if (!/^Q\d+$/.test(qid)) return null;
   try {
-    const rows = await runSparql(buildByQidQuery(qid));
-    if (rows[0]) return rows[0];
+    const fromApi = await getUniversityByQidViaApi(qid, USER_AGENT);
+    if (fromApi) return fromApi;
   } catch (e) {
-    console.error("getUniversityByQid: SPARQL failed, trying Action API", e);
-    return getUniversityByQidViaApi(qid, USER_AGENT);
+    console.error("getUniversityByQid: Action API failed, trying SPARQL", e);
   }
-  return null;
+  const rows = await runSparql(buildByQidQuery(qid));
+  return rows[0] ?? null;
 }

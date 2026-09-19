@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any -- в тестовом стенде моки JSON намеренно допускают разные формы ответов API */
 // Оффлайн-тест пайплайна блока B: все сетевые вызовы подменены.
 // Проверяет: dHash/hamming, парсинг сайта, форму запроса к Gemini и 2ГИС,
 // дедупликацию, применение вердиктов, статистику, покрытие, описание, NDJSON-роут.
@@ -178,6 +179,9 @@ const imageByName: Record<string, Buffer> = {
 globalThis.fetch = (async (input: any, init?: any) => {
   const url = typeof input === "string" ? input : input.url;
   const u = new URL(url);
+  if (u.hostname === "www.wikidata.org" && u.pathname === "/w/api.php") {
+    return Response.json({ entities: { Q1: { id: "Q1", claims: {} } } });
+  }
 
   // Place Details: GET /v1/places/{place_id} — без двоеточий и вложенных сегментов,
   // поэтому ни searchText, ни .../photos/.../media сюда не попадают.
@@ -601,14 +605,14 @@ assert.ok(cityPhoto!.evidence.reasons.some((r) => r.includes("Категория
 const offPhoto = profile.photos.find((p) => p.source === "official_site");
 assert.ok(offPhoto && offPhoto.trust === "verified" && offPhoto.evidence.vision);
 assert.ok(offPhoto!.evidence.reasons[0].includes("example.edu"));
-// Общежитие: ~450 м от якоря places+2gis → verified без понижения
+// Общежитие рядом с вузом, но без совпадения имени/домена → probable.
 const dorm = profile.photos.find((p) => p.id === "places/P_DORM/photos/b");
-assert.ok(dorm && dorm.trust === "verified" && dorm.category === "dorm", JSON.stringify(dorm?.evidence));
+assert.ok(dorm && dorm.trust === "probable" && dorm.category === "dorm", JSON.stringify(dorm?.evidence));
 // Кампус (источник якоря) при подтверждении 2ГИС → probable
 const campus = profile.photos.find((p) => p.id === "places/P_CAMPUS/photos/a");
 assert.ok(campus && campus.trust === "probable", JSON.stringify(campus?.evidence));
 // Описание собрано из данных
-assert.ok(profile.description.includes("Тестовый Университет") && profile.description.includes("2ГИС"));
+assert.ok(profile.description.includes("Тестовый Университет") && profile.description.includes("независимых картографических источников"));
 assert.equal(campus!.evidence.address, "просп. Тестовый, 1, Астана");
 assert.equal(offPhoto!.evidence.address, null);
 assert.ok(profile.photos.every((p) => typeof p.retrievedAt === "string" && !Number.isNaN(Date.parse(p.retrievedAt))), "у каждого снимка дата получения");
@@ -621,6 +625,30 @@ const { GET } = await import("./app/api/profile/route.ts");
 const realFetch = globalThis.fetch;
 globalThis.fetch = (async (input: any, init?: any) => {
   const url = typeof input === "string" ? input : input.url;
+  if (url.startsWith("https://www.wikidata.org/w/api.php")) {
+    const params = new URL(url).searchParams;
+    const entities: Record<string, unknown> = {};
+    for (const id of (params.get("ids") ?? "").split("|")) {
+      if (id === "Q1") entities[id] = {
+        id, labels: { ru: { value: "Тестовый Университет" } },
+        descriptions: { ru: { value: "университет" } },
+        claims: {
+          P31: [{ mainsnak: { datavalue: { value: { id: "Q3918" } } } }],
+          P17: [
+            { qualifiers: { P582: [{}] }, mainsnak: { datavalue: { value: { id: "Q4" } } } },
+            { mainsnak: { datavalue: { value: { id: "Q2" } } } },
+          ],
+          P131: [{ mainsnak: { datavalue: { value: { id: "Q3" } } } }],
+          P856: [{ mainsnak: { datavalue: { value: "https://example.edu" } } }],
+        },
+      };
+      if (id === "Q2") entities[id] = { labels: { ru: { value: "Казахстан" } } };
+      if (id === "Q3") entities[id] = { labels: { ru: { value: "Астана" } } };
+      if (id === "Q4") entities[id] = { labels: { ru: { value: "СССР" } } };
+      if (id === "Q3918") entities[id] = { labels: { ru: { value: "университет" } } };
+    }
+    return Response.json({ entities });
+  }
   if (url.startsWith("https://query.wikidata.org/")) {
     return Response.json({ results: { bindings: [{
       item: { value: "http://www.wikidata.org/entity/Q1" }, itemLabel: { value: "Тестовый Университет" },
@@ -634,24 +662,40 @@ assert.equal(res.headers.get("content-type")?.startsWith("application/x-ndjson")
 const text = await res.text();
 const lines = text.trim().split("\n").map((l) => JSON.parse(l));
 assert.equal(lines[0].type, "university");
+assert.equal(lines[0].university.country, "Казахстан", "историческая страна с P582 не должна подменить действующую");
 assert.ok(lines.some((l) => l.type === "progress" && l.stage === "vision"));
 assert.equal(lines[lines.length - 1].type, "profile");
 assert.equal(lines[lines.length - 1].mode, "deep");
 assert.equal(lines[lines.length - 1].photos.length, profile.photos.length);
 console.log("route ok:", lines.length, "lines;", lines.filter((l) => l.type === "progress").length, "progress events");
 
+// Повторный запрос к тому же QID и режиму должен прийти из кэша без нового обхода.
+const cachedRes = await GET(new Request("http://localhost/api/profile?qid=Q1&mode=deep"));
+const cachedLines = (await cachedRes.text()).trim().split("\n").map((l) => JSON.parse(l));
+assert.equal(cachedLines.length, 2);
+assert.equal(cachedLines[1].type, "profile");
+assert.equal(cachedLines[1].photos.length, profile.photos.length);
+assert.equal(typeof cachedLines[1].cacheAgeMs, "number");
+console.log("profile cache ok");
+
 // Без параметра режим — быстрый взгляд: он дешевле, и профиль обязан это сообщать.
 const quickRes = await GET(new Request("http://localhost/api/profile?qid=Q1"));
-const quickProfile = quickRes.headers.get("content-type")?.startsWith("application/x-ndjson")
-  ? JSON.parse((await quickRes.text()).trim().split("\n").pop()!)
-  : null;
+const quickLines = quickRes.headers.get("content-type")?.startsWith("application/x-ndjson")
+  ? (await quickRes.text()).trim().split("\n").map((line) => JSON.parse(line))
+  : [];
+const quickProfile = quickLines.at(-1);
 assert.ok(quickProfile && quickProfile.type === "profile");
 assert.equal(quickProfile.mode, "quick");
+const streamedPhotos = quickLines.filter((line) => line.type === "progress" && line.stage === "photo");
+assert.ok(streamedPhotos.length > 0, "быстрый борд должен передавать проверенные снимки до итогового профиля");
+assert.ok(streamedPhotos.every((line) => line.photo?.evidence?.vision), "каждое фото в потоке прошло проверку содержимого");
+assert.ok(quickProfile.photos.every((photo: { evidence: { vision: unknown } }) => photo.evidence.vision), "непроверенный снимок не должен попасть в быстрый профиль");
+assert.ok(quickProfile.photos.every((photo: { category: string }) => ["campus", "lecture", "library", "sport", "canteen", "dorm", "outdoor"].includes(photo.category)));
 assert.ok(
   quickProfile.photos.length < profile.photos.length,
   `быстрый взгляд должен быть короче полного: ${quickProfile.photos.length} против ${profile.photos.length}`,
 );
-// По одной-две карточки на категорию: это доска, а не галерея.
+// Небольшой потолок на категорию: это доска, а не галерея.
 for (const c of quickProfile.coverage) {
   const total = c.verified + c.probable + c.unverified;
   assert.ok(total <= 2, `в быстром взгляде категория ${c.category}: ${total} снимков`);

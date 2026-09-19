@@ -1,7 +1,24 @@
+@import "leaflet/dist/leaflet.css";
+
 :root {
-  --background: #faf9f7;
-  --foreground: #16181d;
+  --background: #dce0e8;
+  --foreground: #27363f;
+  --font-sans: "Manrope";
+  --font-editorial: "Cormorant Garamond";
 }
+
+.campusMapShell { border: 1px solid #bfc8ce; background: #f3f4f5; overflow: hidden; }
+.campusMapBar { min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; font-size: 13px; font-weight: 700; color: #27363f; }
+.campusMapBar button { padding: 7px 11px; border: 1px solid #8ea1ae; color: #27363f; background: white; cursor: pointer; }
+.campusMapCanvas { height: 430px; position: relative; background: #dce0e8; }
+.campusMapFallback { position: absolute; z-index: 1000; inset: 12px; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 10px; background: rgba(250,250,250,.94); text-align: center; }
+.campusMapFallback a { text-decoration: underline; color: #6b212c; }
+.campusMapPlaces { list-style: none; display: grid; grid-template-columns: repeat(auto-fit,minmax(210px,1fr)); gap: 0; }
+.campusMapPlaces li { display: flex; align-items: center; gap: 8px; border-top: 1px solid #dce0e8; padding: 11px 14px; font-size: 12px; }
+.campusMapPlaces small { margin-left: auto; white-space: nowrap; color: #685652; }
+.campusMapSwatch { width: 9px; height: 9px; border-radius: 50%; flex: none; background: #27363f; }
+.campusMapSwatchCampus { background: #6b212c; }.campusMapSwatchCity { background: #8ea1ae; }
+@media (max-width: 640px) { .campusMapCanvas { height: 340px; } .campusMapPlaces { grid-template-columns: 1fr; } }
 
 html {
   height: 100%;

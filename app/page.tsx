@@ -15,14 +15,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import dynamic from "next/dynamic";
 import styles from "./page.module.css";
+import { cachedProfile, PROFILE_CACHE_TTL_MS, saveProfile } from "@/lib/profile-cache";
 import {
   ALL_CATEGORIES,
+  QUICK_CATEGORIES,
   CATEGORY_LABELS,
-  type Anchor,
   type Category,
-  type CityCenter,
-  type MapPoint,
   type PhotoItem,
   type PlaceReview,
   type Profile,
@@ -30,6 +30,8 @@ import {
   type TrustTier,
   type UniversityCandidate,
 } from "@/lib/types";
+
+const CampusMap = dynamic(() => import("./CampusMap"), { ssr: false });
 
 const TRUST_LABELS: Record<TrustTier, string> = {
   verified: "Подтверждено",
@@ -53,7 +55,8 @@ const ANCHOR_LABELS: Record<string, string> = {
   none: "не найдены",
 };
 
-const EXAMPLES = ["Назарбаев Университет", "КазНУ имени аль-Фараби", "Казахская национальная академия искусств"];
+const EXAMPLES = ["Harvard University", "Назарбаев Университет", "КазНУ имени аль-Фараби"];
+const recentSearches = new Map<string, { candidates: UniversityCandidate[]; savedAt: number }>();
 
 /** Дата получения снимка: требование 6 кейса допускает дату публикации ИЛИ получения. */
 function formatRetrieved(iso: string): string {
@@ -69,6 +72,8 @@ function formatDistance(m: number): string {
 
 function progressText(e: ProgressEvent): string {
   switch (e.stage) {
+    case "photo":
+      return `Проверено фото: ${CATEGORY_LABELS[e.photo.category]}`;
     case "anchor":
       return e.source === "none" ? "Координаты кампуса не найдены" : `Якорь координат: ${ANCHOR_LABELS[e.source] ?? e.source}`;
     case "places":
@@ -94,7 +99,7 @@ function progressText(e: ProgressEvent): string {
     case "dedupe":
       return `Дубликаты убраны: ${e.duplicates}, осталось ${e.kept}`;
     case "vision":
-      return `Проверяю содержимое: ${e.batches} запрос(ов) к модели…`;
+      return e.batches ? `Проверяю содержимое: ${e.batches} запрос(ов) к модели…` : "Проверяю лучшие изображения для незаполненных категорий…";
     case "done":
       return "Готово";
   }
@@ -144,6 +149,7 @@ function stepOf(stage: ProgressEvent["stage"] | null): number {
     case "dedupe":
       return 2;
     case "vision":
+    case "photo":
       return 3;
     case "done":
       return 4;
@@ -166,9 +172,9 @@ function Steps({ current }: { current: number }) {
   );
 }
 
-function PhotoCard({ photo, onOpen }: { photo: PhotoItem; onOpen: (p: PhotoItem) => void }) {
+function PhotoCard({ photo, onOpen, compact = false }: { photo: PhotoItem; onOpen: (p: PhotoItem) => void; compact?: boolean }) {
   return (
-    <figure className={styles.card}>
+    <figure className={`${styles.card} ${compact ? styles.cardCompact : ""}`}>
       <button type="button" className={styles.thumbButton} onClick={() => onOpen(photo)}>
         {/* next/image здесь не подходит: адреса снимков внешние, короткоживущие и
             заранее неизвестны, а оптимизация чужих URL ничего не даёт. */}
@@ -184,7 +190,7 @@ function PhotoCard({ photo, onOpen }: { photo: PhotoItem; onOpen: (p: PhotoItem)
         <span className={`${styles.badge} ${TRUST_CLASS[photo.trust]}`}>{badgeText(photo)}</span>
         <span className={styles.place}>{placeLine(photo)}</span>
         {photo.evidence.vision && <span>{photo.evidence.vision.caption}</span>}
-        {photo.evidence.address && <span className={styles.dim}>{photo.evidence.address}</span>}
+        {!compact && photo.evidence.address && <span className={styles.dim}>{photo.evidence.address}</span>}
         <span className={styles.captionLinks}>
           {photo.sourceUrl ? (
             <a className={styles.link} href={photo.sourceUrl} target="_blank" rel="noreferrer">
@@ -193,7 +199,7 @@ function PhotoCard({ photo, onOpen }: { photo: PhotoItem; onOpen: (p: PhotoItem)
           ) : (
             <span className={styles.dim}>источник недоступен</span>
           )}
-          {photo.attribution[0] && (
+          {!compact && photo.attribution[0] && (
             <>
               {" · "}
               {photo.attribution[0].uri ? (
@@ -206,14 +212,15 @@ function PhotoCard({ photo, onOpen }: { photo: PhotoItem; onOpen: (p: PhotoItem)
             </>
           )}
         </span>
-        {photo.source === "google_places" && <span className={styles.googleAttribution} translate="no">Google Maps</span>}
-        <span className={styles.dim}>
+        {!compact && photo.source === "google_places" && <span className={styles.googleAttribution} translate="no">Google Maps</span>}
+        {!compact && photo.license && <a className={styles.link} href={photo.license.url} target="_blank" rel="noreferrer">{photo.license.name}</a>}
+        {!compact && <span className={styles.dim}>
           {photo.publishedAt
             ? `опубликовано ${formatRetrieved(photo.publishedAt)}`
             : "дата публикации неизвестна"}
           {" · получено "}
           {formatRetrieved(photo.retrievedAt)}
-        </span>
+        </span>}
       </figcaption>
     </figure>
   );
@@ -226,98 +233,6 @@ function PhotoCard({ photo, onOpen }: { photo: PhotoItem; onOpen: (p: PhotoItem)
  * доверия, расстояния — те самые измеренные значения. Поэтому здесь нет подложки с
  * тайлами: чужие плитки потребовали бы отдельной лицензии и ничего бы не доказали.
  */
-function MapPlan({ anchor, points, cityCenter }: { anchor: Anchor; points: MapPoint[]; cityCenter: CityCenter | null }) {
-  const size = 440;
-  const half = size / 2;
-  const maxDistance = Math.max(600, ...points.map((p) => p.distanceM));
-  const extent = maxDistance * 1.25;
-  const scale = (half - 28) / extent;
-
-  // Равнопромежуточная проекция вокруг якоря: на масштабе в километры её искажения
-  // меньше размера точки, а зависимостей она не требует.
-  const project = (lat: number, lon: number) => {
-    const mPerDegLat = 111_320;
-    const mPerDegLon = 111_320 * Math.cos((anchor.lat * Math.PI) / 180);
-    return { dx: (lon - anchor.lon) * mPerDegLon, dy: -(lat - anchor.lat) * mPerDegLat };
-  };
-
-  const rings = [1500, 6000].filter((r) => r <= extent);
-
-  return (
-    <div className={styles.mapWrap}>
-      <svg viewBox={`0 0 ${size} ${size}`} className={styles.map} role="img" aria-label="План мест вокруг кампуса">
-        <rect width={size} height={size} rx="12" className={styles.mapBg} />
-        {rings.map((r) => (
-          <g key={r}>
-            <circle cx={half} cy={half} r={r * scale} className={styles.mapRing} />
-            <text x={half} y={half - r * scale - 5} className={styles.mapRingLabel} textAnchor="middle">
-              {r >= 1000 ? `${r / 1000} км` : `${r} м`}
-            </text>
-          </g>
-        ))}
-        {cityCenter && (() => {
-          // Центр города почти всегда дальше края плана: показываем направление на него
-          // лучом к границе и подписываем измеренное расстояние.
-          const { dx, dy } = project(cityCenter.lat, cityCenter.lon);
-          const len = Math.hypot(dx, dy) || 1;
-          // Если центр города попадает в масштаб плана — рисуем его на своём месте.
-          // Если нет (обычно так и бывает) — упираем луч в край: направление честное,
-          // расстояние написано цифрой.
-          const maxR = half - 34;
-          const r = Math.min(len * scale, maxR);
-          const x = half + (dx / len) * r;
-          const y = half + (dy / len) * r;
-          return (
-            <g>
-              <line x1={half} y1={half} x2={x} y2={y} className={styles.mapCityLine} />
-              <circle cx={x} cy={y} r="4" className={styles.mapCityDot} />
-              <text x={x} y={y - 9} className={styles.mapCityLabel} textAnchor="middle">
-                центр · {cityCenter.distanceM >= 1000 ? `${(cityCenter.distanceM / 1000).toFixed(1)} км` : `${cityCenter.distanceM} м`}
-              </text>
-            </g>
-          );
-        })()}
-        {points.map((p) => {
-          const { dx, dy } = project(p.lat, p.lon);
-          const x = half + dx * scale;
-          const y = half + dy * scale;
-          return (
-            <g key={p.placeId}>
-              <circle cx={x} cy={y} r={4 + Math.min(p.photos, 3)} className={styles.mapDot} />
-              <title>{`${p.name} — ${p.distanceM} м, снимков: ${p.photos}`}</title>
-            </g>
-          );
-        })}
-        <g>
-          <circle cx={half} cy={half} r="6" className={styles.mapAnchor} />
-          <text x={half} y={half + 20} className={styles.mapAnchorLabel} textAnchor="middle">кампус</text>
-        </g>
-      </svg>
-      <ul className={styles.mapLegend}>
-        {points
-          .slice()
-          .sort((a, b) => a.distanceM - b.distanceM)
-          .slice(0, 6)
-          .map((p) => (
-            <li key={p.placeId}>
-              <span className={styles.dim}>{p.distanceM >= 1000 ? `${(p.distanceM / 1000).toFixed(1)} км` : `${p.distanceM} м`}</span> {p.name}
-            </li>
-          ))}
-      </ul>
-    </div>
-  );
-}
-
-/**
- * Отзывы о кампусе из Google Places.
- *
- * Кейс упоминает «отзывы студентов» среди дополнительных функций, но платформа не
- * сообщает, кем является автор. Поэтому заголовок говорит ровно то, что проверено:
- * это отзывы посетителей места. Зато у них есть настоящая дата публикации —
- * единственный материал в профиле, где она вообще существует.
- */
-/** Возраст материала словами. Дата сама по себе мало говорит, а «три года назад»
- *  сразу отвечает на вопрос «это про сейчас или про давно». */
 function ageNote(iso: string): string {
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return "";
@@ -381,16 +296,16 @@ function Reviews({ reviews, placeName }: { reviews: PlaceReview[]; placeName: st
  * ни на каком экране.
  */
 function QuickBoard({ photos, onOpen }: { photos: PhotoItem[]; onOpen: (p: PhotoItem) => void }) {
-  const groups = ALL_CATEGORIES.map((c) => ({ category: c, items: photos.filter((p) => p.category === c) })).filter(
-    (g) => g.items.length > 0,
-  );
+  const groups = QUICK_CATEGORIES.map((c) => ({ category: c, items: photos.filter((p) => p.category === c) }));
   return (
     <div className={styles.board}>
       {groups.map((g) => (
-        <section key={g.category} className={styles.boardGroup}>
+        <section key={g.category} className={`${styles.boardGroup} ${g.category === "campus" && g.items.length > 0 ? styles.boardFeatured : ""}`}>
           <h3 className={styles.groupLabel}>{CATEGORY_LABELS[g.category]}</h3>
           <div className={styles.boardGrid}>
-            {g.items.map((p) => <PhotoCard key={p.id} photo={p} onOpen={onOpen} />)}
+            {g.items.length > 0
+              ? g.items.map((p) => <PhotoCard key={p.id} photo={p} onOpen={onOpen} compact />)
+              : <div className={styles.boardEmpty}>Фото пока не найдено</div>}
           </div>
         </section>
       ))}
@@ -445,6 +360,8 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [candidates, setCandidates] = useState<UniversityCandidate[]>([]);
   const [profile, setProfile] = useState<Profile | null>(null);
+  const [workingUniversity, setWorkingUniversity] = useState<UniversityCandidate | null>(null);
+  const [quickPhotos, setQuickPhotos] = useState<PhotoItem[]>([]);
   const [catFilter, setCatFilter] = useState<Category | "all">("all");
   const [selected, setSelected] = useState<PhotoItem | null>(null);
   const [loading, setLoading] = useState<"idle" | "resolve" | "profile">("idle");
@@ -465,25 +382,39 @@ export default function Home() {
   }, [selected]);
 
   async function runSearch(text: string) {
+    const searchStartedAt = Date.now();
     setError(null);
     setProfile(null);
+    setWorkingUniversity(null);
+    setQuickPhotos([]);
     setCandidates([]);
     setSelected(null);
     setLoading("resolve");
     try {
-      const res = await fetch(`/api/resolve?q=${encodeURIComponent(text)}`);
-      const json = (await res.json()) as { candidates: UniversityCandidate[]; error?: string };
-      if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
-      if (json.candidates.length === 0) {
-        setError("Университет не найден. Попробуйте другое написание или название на английском.");
-      } else if (json.candidates.length === 1 &&
-        !/^[A-Z]{2,5}$/.test(text.trim()) &&
-        json.candidates[0].resolvedVia !== "places" &&
-        (json.candidates[0].officialWebsite ||
-          (json.candidates[0].lat !== null && json.candidates[0].lon !== null))) {
-        await loadProfile(json.candidates[0].qid);
+      const searchKey = text.trim().normalize("NFKC").toLocaleLowerCase();
+      const previous = recentSearches.get(searchKey);
+      let candidates: UniversityCandidate[];
+      if (previous && Date.now() - previous.savedAt < PROFILE_CACHE_TTL_MS) {
+        candidates = previous.candidates;
       } else {
-        setCandidates(json.candidates);
+        const res = await fetch(`/api/resolve?q=${encodeURIComponent(text)}`);
+        const json = (await res.json()) as { candidates: UniversityCandidate[]; error?: string };
+        if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+        candidates = json.candidates;
+        recentSearches.delete(searchKey);
+        recentSearches.set(searchKey, { candidates, savedAt: Date.now() });
+        if (recentSearches.size > 24) recentSearches.delete(recentSearches.keys().next().value!);
+      }
+      if (candidates.length === 0) {
+        setError("Университет не найден. Попробуйте другое написание или название на английском.");
+      } else if (candidates.length === 1 &&
+        !/^[A-Z]{2,5}$/.test(text.trim()) &&
+        candidates[0].resolvedVia !== "places" &&
+        (candidates[0].officialWebsite ||
+          (candidates[0].lat !== null && candidates[0].lon !== null))) {
+        await loadProfile(candidates[0].qid, "quick", searchStartedAt);
+      } else {
+        setCandidates(candidates);
       }
     } catch (err) {
       setError((err as Error).message);
@@ -497,7 +428,7 @@ export default function Home() {
     await runSearch(query);
   }
 
-  async function loadProfile(qid: string, mode: "quick" | "deep" = "quick") {
+  async function loadProfile(qid: string, mode: "quick" | "deep" = "quick", startedAt = Date.now()) {
     setError(null);
     setCandidates([]);
     setProgress([]);
@@ -506,9 +437,15 @@ export default function Home() {
     setLastQid(qid);
     // При углублении уже показанный профиль остаётся на экране: пользователь нажал
     // «подробнее», а не «начать заново», и терять картинку на двадцать секунд незачем.
-    if (mode === "quick") setProfile(null);
+    if (mode === "quick") { setProfile(null); setQuickPhotos([]); setWorkingUniversity(null); }
     try {
-      const res = await fetch(`/api/profile?qid=${qid}&mode=${mode}`);
+      const cached = cachedProfile(qid, mode);
+      if (cached) {
+        setProfile({ ...cached.profile, timingMs: 0, cacheAgeMs: cached.ageMs });
+        setCatFilter("all");
+        return;
+      }
+      const res = await fetch(`/api/profile?qid=${qid}&mode=${mode}&startedAt=${startedAt}`);
       if (!res.ok || !res.body) {
         const json = (await res.json().catch(() => ({}))) as { error?: string };
         throw new Error(json.error ?? `HTTP ${res.status}`);
@@ -529,10 +466,18 @@ export default function Home() {
           if (msg.type === "progress") {
             const event = msg as unknown as ProgressEvent;
             setStage(event.stage);
-            setProgress((prev) => [...prev, progressText(event)]);
+            if (event.stage === "photo") {
+              setQuickPhotos((prev) => prev.some((p) => p.id === event.photo.id) ? prev : [...prev, event.photo]);
+            } else {
+              setProgress((prev) => [...prev, progressText(event)]);
+            }
+          } else if (msg.type === "university") {
+            setWorkingUniversity(msg.university as UniversityCandidate);
           } else if (msg.type === "profile") {
             // Поле type — служебное для потока NDJSON; на профиль оно не влияет.
-            setProfile(msg as unknown as Profile);
+            const nextProfile = msg as unknown as Profile;
+            saveProfile(nextProfile);
+            setProfile(nextProfile);
             setCatFilter("all");
           } else if (msg.type === "error") {
             throw new Error(String(msg.error));
@@ -553,6 +498,7 @@ export default function Home() {
   // утверждение — это не объекты вуза, и мешать их с кампусом нельзя.
   const isPlace = (p: PhotoItem) => p.category !== "city" && p.category !== "citywide";
   const official = visible.filter((p) => p.source === "official_site" && isPlace(p));
+  const commons = visible.filter((p) => p.source === "wikimedia_commons" && isPlace(p));
   const visitors = visible.filter((p) => p.source === "google_places" && isPlace(p));
   const around = visible.filter((p) => p.category === "city");
   const cityPhotos = visible.filter((p) => p.category === "citywide");
@@ -585,26 +531,23 @@ export default function Home() {
       <main className={styles.inner}>
         {!profile && loading === "idle" && candidates.length === 0 && !error && (
           <section className={styles.hero}>
-            <h1 className={styles.heroTitle}>Не просто фотографии вуза, а причина им верить</h1>
-            <p className={styles.heroText}>
-              Сервис собирает снимки кампуса из открытых источников, проверяет каждый — расстояние до кампуса,
-              содержимое кадра, дубликаты — и показывает результат проверки рядом с фотографией. Если подтвердить
-              снимок нечем, так и написано.
-            </p>
-            <div className={styles.examples}>
-              {EXAMPLES.map((name) => (
-                <button
-                  key={name}
-                  type="button"
-                  className={styles.example}
-                  onClick={() => {
-                    setQuery(name);
-                    void runSearch(name);
-                  }}
-                >
-                  {name}
-                </button>
-              ))}
+            <div className={styles.heroCopy}>
+              <span className={styles.eyebrow}>ВИЗУАЛЬНЫЙ АТЛАС УНИВЕРСИТЕТОВ</span>
+              <h1 className={styles.heroTitle}>Увидеть университет <em>по-настоящему.</em></h1>
+              <p className={styles.heroText}>Кампусы, аудитории, библиотеки и повседневная жизнь — реальные фотографии из разных источников. У каждого кадра есть проверка и происхождение.</p>
+              <p className={styles.heroHint}>Введите название университета в строку поиска выше или начните с примера:</p>
+              <div className={styles.examples}>
+                {EXAMPLES.map((name) => (
+                  <button key={name} type="button" className={styles.example} onClick={() => { setQuery(name); void runSearch(name); }}>
+                    {name} <span aria-hidden="true">↗</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className={styles.heroAside} aria-hidden="true">
+              <span className={styles.heroAsideTop}>SHYNGAN / 2026</span>
+              <div className={styles.heroAsideWord}>Campus<br /><i>in focus.</i></div>
+              <div className={styles.heroAsideFoot}><span>01 / 03</span><span>ПОИСК · БОРД · ПРОФИЛЬ</span></div>
             </div>
           </section>
         )}
@@ -614,7 +557,7 @@ export default function Home() {
         {loading === "profile" && (
           <div className={styles.progress}>
             <div className={styles.progressTitle}>
-              {profile ? "Собираю полный профиль — это дольше быстрого взгляда" : "Собираю профиль — обычно менее 30 секунд"}
+              {profile ? "Собираю подробный профиль" : "Проверяю фотографии и заполняю визуальный борд"}
             </div>
             <Steps current={stepOf(stage)} />
             <ul className={styles.progressList}>
@@ -638,6 +581,17 @@ export default function Home() {
           </section>
         )}
 
+        {!profile && workingUniversity && loading === "profile" && (
+          <section className={styles.liveBoard}>
+            <div className={styles.liveBoardHead}>
+              <span className={styles.eyebrow}>QUICK VISUAL BOARD</span>
+              <h2 className={styles.sectionTitle}>{workingUniversity.label}</h2>
+              <p>{quickPhotos.length > 0 ? `${quickPhotos.length} проверенных фото уже доступно. Остальные категории ещё собираются.` : "Ищем фотографии в нескольких источниках…"}</p>
+            </div>
+            <QuickBoard photos={quickPhotos} onOpen={setSelected} />
+          </section>
+        )}
+
         {profile && (
           <>
             <section className={styles.profileHead}>
@@ -657,7 +611,9 @@ export default function Home() {
                   )}
                 </span>
                 <span className={styles.dot}>
-                  {profile.photos.length} фото за {(profile.timingMs / 1000).toFixed(1)} с
+                  {profile.photos.length} фото {profile.cacheAgeMs !== undefined
+                    ? "из кэша"
+                    : `за ${(profile.timingMs / 1000).toFixed(1)} с`}
                 </span>
                 {profile.cityCenter && (
                   <span className={styles.dot}>
@@ -667,7 +623,7 @@ export default function Home() {
               </div>
               <p className={styles.description}>{profile.description}</p>
 
-              <details className={styles.audit}>
+              {profile.mode === "deep" && <details className={styles.audit}>
                 <summary className={styles.auditSummary}>Как собран этот профиль</summary>
                 <div className={styles.auditGrid}>
                   <span>Якорь координат: {ANCHOR_LABELS[profile.anchor?.source ?? "none"]}</span>
@@ -680,6 +636,7 @@ export default function Home() {
                   ))}
                   <span>С сайта вуза: {profile.sources.official}</span>
                   <span>Из Google Places: {profile.sources.visitors}</span>
+                  <span>Из Wikimedia Commons: {profile.sources.commons}</span>
                   <span>Дубликатов убрано: {profile.removed.duplicates}</span>
                   <span>Не по теме: {profile.removed.irrelevant}</span>
                   <span>Размытых: {profile.removed.blurry}</span>
@@ -691,28 +648,25 @@ export default function Home() {
                   <span>Город крупным планом: {profile.removed.cityNotWide}</span>
                   {!profile.visionAvailable && <span>Содержимое снимков не проверялось</span>}
                 </div>
-              </details>
+              </details>}
 
-              {profile.warnings.length > 0 && (
+              {profile.mode === "deep" && profile.warnings.length > 0 && (
                 <ul className={styles.warnings}>
                   {profile.warnings.map((w, i) => <li key={i}>{w}</li>)}
                 </ul>
               )}
             </section>
 
-            {profile.anchor && profile.mapPoints.length > 0 && (
+            {profile.mode === "deep" && profile.anchor && (
               <section className={styles.section}>
                 <div className={styles.sectionHead}>
-                  <h2 className={styles.sectionTitle}>План кампуса</h2>
+                  <h2 className={styles.sectionTitle}>Кампус на карте</h2>
                   <span className={styles.sectionCount}>{profile.mapPoints.length} мест</span>
                 </div>
                 <p className={styles.sectionNote}>
-                  Места, давшие снимки, и измеренные до них расстояния. Кольцо — порог подтверждения:
-                  внутри 1,5 км место проходит географическую проверку; для подтверждения снимка нужны и другие признаки. Масштаб подстраивается под самое
-                  дальнее место, поэтому кольцо в 6 км видно не всегда.
-                  {profile.cityCenter && ` Луч показывает направление на центр города (${profile.cityCenter.name}).`}
+                  Реальная точка кампуса, места с найденными фотографиями и расстояния по прямой. Центр города отмечен отдельно.
                 </p>
-                <MapPlan anchor={profile.anchor} points={profile.mapPoints} cityCenter={profile.cityCenter} />
+                <CampusMap anchor={profile.anchor} points={profile.mapPoints} cityCenter={profile.cityCenter} />
                 {profile.cityCenter && (
                   <p className={styles.attribution}>
                     Координаты центра города — <a className={styles.link} href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© участники OpenStreetMap</a>, лицензия ODbL.
@@ -721,7 +675,40 @@ export default function Home() {
               </section>
             )}
 
-            <div className={styles.filters}>
+            {profile.mode === "deep" && profile.deepContext && (
+              <section className={styles.section}>
+                <div className={styles.sectionHead}><h2 className={styles.sectionTitle}>Город для жизни</h2></div>
+                <p className={styles.sectionNote}>Ориентиры из открытых данных. Расстояния до остановок измерены по прямой; расписание и маршруты здесь не проверяются.</p>
+                <div className={styles.contextGrid}>
+                  <div className={styles.contextCard}>
+                    <span className={styles.eyebrow}>КЛИМАТ</span>
+                    {profile.deepContext.climate ? <>
+                      <strong>Зима {profile.deepContext.climate.winterC}° · лето {profile.deepContext.climate.summerC}°</strong>
+                      <p>Средняя температура за {profile.deepContext.climate.years}; осадки около {profile.deepContext.climate.annualPrecipitationMm} мм в год.</p>
+                      <a className={styles.link} href={profile.deepContext.climate.sourceUrl} target="_blank" rel="noreferrer">Исторические данные Open-Meteo ↗</a>
+                    </> : <p>Данные о климате пока недоступны.</p>}
+                  </div>
+                  <div className={styles.contextCard}>
+                    <span className={styles.eyebrow}>ТРАНСПОРТ</span>
+                    {profile.deepContext.transport.length > 0 ? <>
+                      <strong>Остановки рядом с кампусом</strong>
+                      <ul>{profile.deepContext.transport.slice(0, 5).map((stop, i) => <li key={`${stop.name}-${i}`}>{stop.name} · {stop.kind} <small>{formatDistance(stop.distanceM)}</small></li>)}</ul>
+                      {profile.deepContext.transportSourceUrl && <a className={styles.link} href={profile.deepContext.transportSourceUrl} target="_blank" rel="noreferrer">Данные {profile.deepContext.transportSourceUrl.includes("google.com") ? "Google Maps" : "OpenStreetMap"} ↗</a>}
+                    </> : <p>Остановки не найдены или картографический источник не ответил.</p>}
+                  </div>
+                  <div className={styles.contextCard}>
+                    <span className={styles.eyebrow}>СТОИМОСТЬ ЖИЗНИ</span>
+                    {profile.deepContext.livingCosts ? <>
+                      <strong>Ориентиры для {profile.deepContext.livingCosts.city}</strong>
+                      <ul>{profile.deepContext.livingCosts.items.map((item) => <li key={item.label}>{item.label}<small>≈ {Math.round(item.average)} {profile.deepContext!.livingCosts!.currency} {item.unit}</small></li>)}</ul>
+                      <a className={styles.link} href="https://www.numbeo.com/cost-of-living/" target="_blank" rel="noreferrer">Источник: Numbeo{profile.deepContext.livingCosts.updated ? ` · обновлено ${profile.deepContext.livingCosts.updated}` : ""} ↗</a>
+                    </> : <p>Проверенная оценка для этого города недоступна. Цены не рассчитываются без лицензированного источника.</p>}
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {profile.mode === "deep" && <div className={styles.filters}>
               <button
                 type="button"
                 className={`${styles.chip} ${catFilter === "all" ? styles.chipActive : ""}`}
@@ -743,18 +730,20 @@ export default function Home() {
                   </button>
                 );
               })}
-            </div>
+            </div>}
 
             {profile.mode === "quick" ? (
               <>
+                <div className={styles.boardIntro}>
+                  <span className={styles.eyebrow}>ПЕРВЫЙ ВЗГЛЯД / QUICK VISUAL BOARD</span>
+                  <h2 className={styles.sectionTitle}>Семь граней кампуса</h2>
+                  <p>Показываем только фотографии, прошедшие проверку содержимого. Источник и уровень доверия открываются у каждого кадра.</p>
+                </div>
                 <QuickBoard photos={visible} onOpen={setSelected} />
                 <section className={styles.deepDive}>
                   <h2 className={styles.sectionTitle}>Это был быстрый взгляд</h2>
                   <p className={styles.sectionNote}>
-                    Здесь по одному-два снимка на категорию: так профиль собирается за несколько секунд и не тратит
-                    лишних запросов. Полный сбор идёт глубже — больше запросов к картам, обход разделов сайта вуза
-                    вместе со страницами новостей, где у снимков есть настоящая дата публикации, и больше фотографий
-                    в каждой категории. Занимает примерно вдвое дольше.
+                    Больше фотографий и категорий, отзывы, карта кампуса и сведения о городе.
                   </p>
                   <button
                     type="button"
@@ -762,7 +751,7 @@ export default function Home() {
                     disabled={loading !== "idle" || !lastQid}
                     onClick={() => lastQid && loadProfile(lastQid, "deep")}
                   >
-                    {loading === "profile" ? "Собираю…" : "Показать подробно"}
+                    {loading === "profile" ? "Собираю…" : "Хочу ещё →"}
                   </button>
                 </section>
               </>
@@ -783,6 +772,15 @@ export default function Home() {
               photos={visitors}
               groupByCategory
               emptyText="Снимков посетителей по этому фильтру нет."
+              onOpen={setSelected}
+            />
+
+            <Section
+              title="Wikimedia Commons"
+              note="Файлы из категории, связанной с карточкой выбранного вуза. У каждого указаны автор, лицензия и страница файла. Категория не доказывает место съёмки, поэтому географическое доверие остаётся неподтверждённым."
+              photos={commons}
+              groupByCategory
+              emptyText="В итоговый профиль не попали снимки из Commons: их могло не быть в связанной категории, либо они не прошли проверку и лимиты галереи."
               onOpen={setSelected}
             />
 
@@ -834,7 +832,7 @@ export default function Home() {
               </div>
               <div className={styles.factRow}>
                 <span className={styles.factKey}>Источник</span>
-                <span>{selected.source === "official_site" ? "сайт вуза" : <span className={styles.googleAttribution} translate="no">Google Maps</span>}</span>
+                <span>{selected.source === "official_site" ? "сайт вуза" : selected.source === "wikimedia_commons" ? "Wikimedia Commons" : <span className={styles.googleAttribution} translate="no">Google Maps</span>}</span>
               </div>
               {selected.sourceUrl && (
                 <div className={styles.factRow}>
@@ -848,8 +846,14 @@ export default function Home() {
                   {author.uri ? <a className={styles.link} href={author.uri} target="_blank" rel="noreferrer">{author.name}</a> : <span>{author.name}</span>}
                 </div>
               ))}
+              {selected.license && (
+                <div className={styles.factRow}>
+                  <span className={styles.factKey}>Лицензия</span>
+                  <a className={styles.link} href={selected.license.url} target="_blank" rel="noreferrer">{selected.license.name}</a>
+                </div>
+              )}
               <div className={styles.factRow}>
-                <span className={styles.factKey}>{selected.source === "official_site" ? "Страница" : "Место"}</span>
+                <span className={styles.factKey}>{selected.source === "official_site" ? "Страница" : selected.source === "wikimedia_commons" ? "Файл" : "Место"}</span>
                 <span>{placeLine(selected)}</span>
               </div>
               {selected.evidence.address && (

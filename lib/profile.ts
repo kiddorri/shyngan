@@ -10,6 +10,8 @@
 // Каждая строка в evidence.reasons — реально выполненная проверка.
 
 import { describeCampus } from "./describe";
+import { loadDeepContext } from "./deep-context";
+import { findCommonsPhotos } from "./commons";
 import { haversineM } from "./geo";
 import { dHash, hamming, loadImage, sharpness, type LoadedImage } from "./image";
 import { chooseAnchor, AGREEMENT_RADIUS_M, type LocationObservation } from "./location";
@@ -20,6 +22,7 @@ import { findInTwoGis } from "./twogis";
 import { BATCH_SIZE, classifyImages, type VisionInput } from "./vision";
 import {
   ALL_CATEGORIES,
+  QUICK_CATEGORIES,
   type Anchor,
   type Category,
   type CityCenter,
@@ -107,13 +110,15 @@ const QUERY_PLAN: QueryPlanItem[] = [
   { category: "lecture", build: (u) => `${u.label} учебный корпус`, pageSize: 2, quick: true },
   { category: "dorm", build: (u) => `${u.label} общежитие`, pageSize: 2, quick: true },
   { category: "library", build: (u) => `${u.label} библиотека`, pageSize: 2, quick: true },
-  { category: "lab", build: (u) => `${u.label} лаборатория`, pageSize: 2, quick: true },
+  { category: "lab", build: (u) => `${u.label} лаборатория`, pageSize: 2 },
   { category: "sport", build: (u) => `${u.label} спортивный комплекс`, pageSize: 2, quick: true },
   // Места, которые студент видит каждый день, но которых не было в плане.
   // «Актовый зал» ищем отдельно от учебных корпусов: в Places это чаще самостоятельное
   // место, а внутри — ряды кресел и сцена, то есть ровно та категория, которая пустует.
   { category: "lecture", build: (u) => `${u.label} актовый зал`, pageSize: 1 },
-  { category: "life", build: (u) => `${u.label} столовая`, pageSize: 1, quick: true },
+  { category: "canteen", build: (u) => `${u.label} столовая`, pageSize: 2, quick: true },
+  { category: "outdoor", build: (u) => `${u.label} территория кампуса`, pageSize: 2, quick: true },
+  { category: "life", build: (u) => `${u.label} студенческая жизнь`, pageSize: 2 },
   // Запросов «музей» и «коворкинг» здесь быть не должно. Оба слова сильнее привязаны
   // к известным городским заведениям, чем к названию вуза: по «<вуз> музей» Places
   // отдаёт главный музей города за несколько километров от кампуса, и снимок доходит
@@ -121,7 +126,7 @@ const QUERY_PLAN: QueryPlanItem[] = [
   // если он есть, находится внутри корпуса и попадает в профиль по другим запросам.
   // Окружение кампуса ищем рядом с якорем, а не по названию города: студенту
   // полезен парк в десяти минутах ходьбы, а не панорама центра в восьми километрах.
-  { category: "city", build: () => "парк", pageSize: 1, biasRadiusM: NEIGHBORHOOD_BIAS_RADIUS_M, quick: true },
+  { category: "city", build: () => "парк", pageSize: 1, biasRadiusM: NEIGHBORHOOD_BIAS_RADIUS_M },
   { category: "city", build: () => "кафе", pageSize: 1, biasRadiusM: NEIGHBORHOOD_BIAS_RADIUS_M },
   // А это уже сам город — требование 2 кейса. Отдельные запросы и широкий радиус:
   // центр города к кампусу не привязан и может быть в десятке километров.
@@ -129,7 +134,7 @@ const QUERY_PLAN: QueryPlanItem[] = [
   // Запросы выбраны под общие виды, а не под «что угодно в городе»: у смотровой
   // площадки и набережной посетители снимают панораму, у «достопримечательностей» —
   // крупный план памятника. Город должен быть виден городом.
-  { category: "citywide", build: (u) => (u.city ? `${u.city} смотровая площадка` : null), pageSize: 2, biasRadiusM: CITY_BIAS_RADIUS_M, quick: true },
+  { category: "citywide", build: (u) => (u.city ? `${u.city} смотровая площадка` : null), pageSize: 2, biasRadiusM: CITY_BIAS_RADIUS_M },
   { category: "citywide", build: (u) => (u.city ? `${u.city} набережная` : null), pageSize: 1, biasRadiusM: CITY_BIAS_RADIUS_M },
   { category: "citywide", build: (u) => (u.city ? `${u.city} центр города` : null), pageSize: 2, biasRadiusM: CITY_BIAS_RADIUS_M },
 ];
@@ -144,6 +149,7 @@ type RawPhoto = {
   imageUrl: string;
   sourceUrl: string | null;
   attribution: PhotoItem["attribution"];
+  license: PhotoItem["license"];
   category: Category;
   trust: TrustTier;
   evidence: Evidence;
@@ -153,11 +159,26 @@ type RawPhoto = {
 
 type Loaded = { raw: RawPhoto; img: LoadedImage; hash: string };
 
+/** A facade is visually a campus building, but a named library or dormitory
+ * remains that facility when the place itself supplies independent evidence. */
+function categoryFromEvidence(raw: RawPhoto, verdict: VisionVerdict): Category | "other" {
+  if (verdict.category !== "campus" || raw.source !== "google_places") return verdict.category;
+  const name = raw.evidence.placeName.toLocaleLowerCase();
+  const patterns: Partial<Record<Category, RegExp>> = {
+    library: /librar|библиотек|кітапхан|图书馆|圖書館|도서관|図書館/i,
+    dorm: /dorm|residen|общежити|жатақхан|宿舍|기숙사|寮/i,
+    sport: /sport|athletic|gymnasium|спорт|спортив|体育|體育|체육/i,
+    canteen: /canteen|cafeteria|dining hall|столов|асхан|食堂|학생식당/i,
+    lecture: /lecture|classroom|аудитор|учебный корпус|教学楼|教學樓|강의동/i,
+  };
+  return patterns[raw.category]?.test(name) ? raw.category : verdict.category;
+}
+
 const TIER_RANK: Record<TrustTier, number> = { verified: 0, probable: 1, unverified: 2 };
-const SOURCE_RANK: Record<PhotoSource, number> = { official_site: 0, google_places: 1 };
+const SOURCE_RANK: Record<PhotoSource, number> = { official_site: 0, google_places: 1, wikimedia_commons: 2 };
 /** Порядок вывода: объекты вуза впереди, город последним. */
 const CATEGORY_RANK: Record<Category, number> = {
-  campus: 0, lecture: 1, dorm: 2, library: 3, lab: 4, sport: 5, life: 6, city: 7, citywide: 8,
+  campus: 0, lecture: 1, library: 2, sport: 3, canteen: 4, dorm: 5, outdoor: 6, lab: 7, life: 8, city: 9, citywide: 10,
 };
 
 // ---- Доверие по расстоянию ----
@@ -378,6 +399,7 @@ async function placeToRaw(
       imageUrl,
       sourceUrl: p.googleMapsUri ?? place.googleMapsUri ?? null,
       attribution: (p.authorAttributions ?? []).map((a) => ({ name: a.displayName, uri: a.uri ?? null })),
+      license: null,
       category,
       trust,
       evidence: {
@@ -433,6 +455,20 @@ function freshnessRank(publishedAt: string | null): number {
  *  небольшая атака: при повторных сборах сайт начинал отвечать отказом, и профиль
  *  оставался пустым. Вежливость здесь не только этика, но и работоспособность. */
 const DOWNLOAD_CONCURRENCY = 6;
+/** В быстром взгляде медленный сайт не должен задерживать уже найденные снимки Places. */
+const QUICK_OFFICIAL_BUDGET_MS = 6500;
+const QUICK_TOTAL_BUDGET_MS = 28000;
+
+async function withDeadline<T>(promise: Promise<T>, remainingMs: number, fallback: T): Promise<T> {
+  if (remainingMs <= 0) return fallback;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), remainingMs);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      () => { clearTimeout(timer); resolve(fallback); },
+    );
+  });
+}
 
 /** Выполняет задачи пачками по limit штук, сохраняя порядок результатов. */
 async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -490,13 +526,13 @@ function limitsFor(mode: ProfileMode) {
   return mode === "quick"
     ? {
         photosPerPlace: 1,
-        maxPlacesPhotos: 16,
+        maxPlacesPhotos: 20,
         // Было 6/2: быстрый взгляд — это то, что видит жюри по умолчанию, и с этими
         // потолками он показывал 1-2 фотографии на категорию даже когда кандидатов
         // хватало на больше. maxDuration у /api/profile — 180 с, а быстрый обычно
         // укладывается в 10-15 — запас есть, несколько лишних снимков его не тронут.
         maxOfficialPhotos: 9,
-        maxPerCategory: 3,
+        maxPerCategory: 2,
         maxCityPhotos: 1,
         maxCitywidePhotos: 1,
       }
@@ -514,8 +550,11 @@ export async function buildProfile(
   university: UniversityCandidate,
   onProgress: (e: ProgressEvent) => void = () => {},
   mode: ProfileMode = "deep",
+  quickBudgetMs = QUICK_TOTAL_BUDGET_MS,
 ): Promise<Profile> {
   const started = Date.now();
+  const quickDeadline = mode === "quick" ? started + Math.min(QUICK_TOTAL_BUDGET_MS, quickBudgetMs) : Infinity;
+  const timeLeft = () => Math.max(0, quickDeadline - Date.now());
   const limits = limitsFor(mode);
   const plan = QUERY_PLAN.filter((item) => mode === "deep" || item.quick);
   const warnings: string[] = [];
@@ -568,11 +607,26 @@ export async function buildProfile(
         candidates: [], pagesVisited: [], blockedByRobots: [], robotsNote: null,
         skippedForTime: 0, error: "официальный сайт вуза неизвестен",
       });
+  const selectedOfficialPromise = mode === "quick"
+    ? withDeadline(officialPromise, QUICK_OFFICIAL_BUDGET_MS, {
+        candidates: [], pagesVisited: [], blockedByRobots: [], robotsNote: null, skippedForTime: 0,
+        error: "сайт не ответил за время быстрого взгляда; полный сбор продолжит его проверку",
+      })
+    : officialPromise;
+  // Commons — дополнительный источник с более слабой географической привязкой.
+  // Его несколько последовательных API-запросов не должны задерживать быстрый взгляд.
+  const commonsPromise = (university.qid.startsWith("Q") ? findCommonsPhotos(university.qid, mode === "deep" ? 8 : 6) : Promise.resolve([]))
+    .catch((e) => {
+      warnings.push(`Wikimedia Commons: запрос не выполнен (${(e as Error).message})`);
+      return [];
+    });
 
   let campusPlaces: Place[] = [];
   try {
     campusPlaces = campusQuery
-      ? await searchText(campusQuery, { bias: wikidataBias, pageSize: Math.max(3, campusPlan.pageSize) })
+      ? await (mode === "quick"
+          ? withDeadline(searchText(campusQuery, { bias: wikidataBias, pageSize: Math.max(3, campusPlan.pageSize) }), 6500, [])
+          : searchText(campusQuery, { bias: wikidataBias, pageSize: Math.max(3, campusPlan.pageSize) }))
       : [];
   } catch (e) {
     warnings.push(`Places: основной запрос не выполнен (${(e as Error).message})`);
@@ -601,7 +655,8 @@ export async function buildProfile(
   const googlePoint = campusPlace?.location
     ? { lat: campusPlace.location.latitude, lon: campusPlace.location.longitude }
     : null;
-  const twoGis = await (twoGisPromise ?? (googlePoint ? findInTwoGis(university.label, googlePoint) : Promise.resolve(null)));
+  const twoGisWork = twoGisPromise ?? (googlePoint ? findInTwoGis(university.label, googlePoint) : Promise.resolve(null));
+  const twoGis = mode === "quick" ? await withDeadline(twoGisWork, Math.min(1500, timeLeft()), null) : await twoGisWork;
   const points: LocationObservation[] = [];
   if (wikidataBias) points.push({ source: "wikidata", name: university.label, address: null, lat: wikidataBias.lat, lon: wikidataBias.lon });
   if (googlePoint) points.push({ source: "places", name: campusPlace.displayName?.text ?? university.label,
@@ -618,12 +673,13 @@ export async function buildProfile(
     }
   }
   onProgress({ stage: "anchor", source: anchor?.source ?? "none" });
+  const deepContextPromise = mode === "deep" ? loadDeepContext(university, anchor) : Promise.resolve(undefined);
 
   // Дополнительные функции кейса: расстояние до центра города и отзывы о кампусе.
   // Запускаем сразу и забираем в самом конце — они не должны удлинять сборку профиля.
   const anchorForCity = anchor;
   const cityCenterPromise: Promise<CityCenter | null> =
-    university.city && anchorForCity
+    mode === "deep" && university.city && anchorForCity
       ? findCityCenter(university.city, USER_AGENT, university.country).then((c) =>
           c
             ? {
@@ -639,7 +695,7 @@ export async function buildProfile(
   // Отзывы тарифицируются по более дорогому SKU Places, поэтому их можно выключить
   // переменной окружения, не трогая код.
   const reviewsPromise: Promise<PlaceReview[]> =
-    campusPlace && process.env.PLACE_REVIEWS !== "off" ? getPlaceReviews(campusPlace.id) : Promise.resolve([]);
+    mode === "deep" && campusPlace && process.env.PLACE_REVIEWS !== "off" ? getPlaceReviews(campusPlace.id) : Promise.resolve([]);
 
   // Город кампуса по данным карт — эталон для сверки городских снимков.
   const campusCity = campusPlace ? localityOf(campusPlace) : null;
@@ -647,9 +703,8 @@ export async function buildProfile(
   const bias = anchor ? { lat: anchor.lat, lon: anchor.lon, radiusM: SEARCH_BIAS_RADIUS_M } : undefined;
 
   // 3. Остальные запросы к Places. Обход официального сайта уже выполняется.
-  const [restResults, official] = await Promise.all([
-    Promise.all(
-      restPlan.map(async (item) => {
+  const restResults = await Promise.all(
+    restPlan.map(async (item) => {
         const q = item.build(university);
         if (!q) return { category: item.category, places: [] as Place[] };
         const itemBias = bias && item.biasRadiusM ? { ...bias, radiusM: item.biasRadiusM } : bias;
@@ -657,15 +712,14 @@ export async function buildProfile(
         // уходит не на поиск, а на загрузку и проверку снимков.
         const pageSize = mode === "quick" ? 1 : item.pageSize;
         try {
-          return { category: item.category, places: await searchText(q, { bias: itemBias, pageSize }) };
+          const request = searchText(q, { bias: itemBias, pageSize });
+          return { category: item.category, places: mode === "quick" ? await withDeadline(request, Math.min(6500, timeLeft()), []) : await request };
         } catch (e) {
           warnings.push(`Places: запрос «${q}» не выполнен (${(e as Error).message})`);
           return { category: item.category, places: [] as Place[] };
         }
-      }),
-    ),
-    officialPromise,
-  ]);
+    }),
+  );
 
   // Одно место — одна категория. Первое вхождение побеждает (campus идёт первым).
   const seenPlaces = new Set<string>();
@@ -687,12 +741,18 @@ export async function buildProfile(
   // и категория остаётся пустой не потому, что снимков не нашлось.
   const perPlace = await Promise.all(
     jobs.map((j) =>
-      placeToRaw(j.place, j.category, anchor, anchorPlaceId, university.city, campusCity, university.label, university.officialWebsite, limits.photosPerPlace),
+      mode === "quick"
+        ? withDeadline(placeToRaw(j.place, j.category, anchor, anchorPlaceId, university.city, campusCity, university.label, university.officialWebsite, limits.photosPerPlace), Math.min(5000, timeLeft()), [])
+        : placeToRaw(j.place, j.category, anchor, anchorPlaceId, university.city, campusCity, university.label, university.officialWebsite, limits.photosPerPlace),
     ),
   );
   const placesRaw = interleave(perPlace, limits.maxPlacesPhotos);
   onProgress({ stage: "places", found: placesRaw.length });
 
+  // Разрешение URL снимков Places выполнялось только после завершения обхода
+  // сайта, хотя эти операции независимы. Дожидаемся сайта лишь перед сбором
+  // общего набора кандидатов.
+  const official = await selectedOfficialPromise;
 
   if (official.error) warnings.push(`Официальный сайт: ${official.error}`);
   else if (official.pagesVisited.length > 1) {
@@ -727,6 +787,7 @@ export async function buildProfile(
     imageUrl: c.url,
     sourceUrl: c.pageUrl,
     attribution: [{ name: officialHost ?? "официальный сайт", uri: university.officialWebsite }],
+    license: null,
     category: "campus",
     trust: "verified",
     evidence: {
@@ -753,11 +814,41 @@ export async function buildProfile(
   }));
   onProgress({ stage: "official", found: officialRaw.length, error: official.error });
 
+  const commonsFiles = mode === "quick" ? await withDeadline(commonsPromise, Math.min(1200, timeLeft()), []) : await commonsPromise;
+  const commonsRaw: RawPhoto[] = commonsFiles.map((file) => ({
+    id: `commons/${file.title}`,
+    source: "wikimedia_commons",
+    publishedAt: null,
+    imageUrl: file.imageUrl,
+    sourceUrl: file.sourceUrl,
+    attribution: [{ name: file.author, uri: file.sourceUrl }],
+    license: { name: file.licenseName, url: file.licenseUrl },
+    category: "campus",
+    trust: "unverified",
+    evidence: {
+      anchorSource: anchor?.source ?? "none",
+      placeId: null,
+      placeName: file.title.replace(/^File:/, ""),
+      address: null,
+      distanceM: null,
+      queryIntent: null,
+      vision: null,
+      reasons: [
+        `Файл найден в категории Wikimedia Commons, связанной с карточкой вуза ${university.qid}, или в её тематическом подразделе: ${file.categoryUrl}`,
+        `У файла указана лицензия ${file.licenseName}; она разрешает использование на своих условиях, но не подтверждает, что снимок показывает этот вуз`,
+        "Координаты съёмки не подтверждены; принадлежность изображённого университету не доказана",
+      ],
+    },
+    widthPx: file.width,
+    heightPx: file.height,
+  }));
+
   // 4. Загрузка всех картинок. Официальные — с проверкой размера (на сайтах много иконок).
-  const allRaw = [...officialRaw, ...placesRaw];
+  const allRaw = [...officialRaw, ...placesRaw, ...commonsRaw];
   onProgress({ stage: "download", total: allRaw.length });
 
-  const loadedOrNull = await mapWithLimit(allRaw, DOWNLOAD_CONCURRENCY, async (raw): Promise<Loaded | null> => {
+  const completedDownloads: Loaded[] = [];
+  const downloadWork = mapWithLimit(allRaw, DOWNLOAD_CONCURRENCY, async (raw): Promise<Loaded | null> => {
       const img = await loadImage(raw.imageUrl, USER_AGENT);
       if (!img) {
         removed.failedDownload++;
@@ -778,9 +869,13 @@ export async function buildProfile(
         raw.widthPx = img.width;
         raw.heightPx = img.height;
       }
-      return { raw, img, hash };
+      const result = { raw, img, hash };
+      completedDownloads.push(result);
+      return result;
   });
-  let loaded = loadedOrNull.filter((x): x is Loaded => x !== null);
+  if (mode === "quick") await withDeadline(downloadWork, Math.max(0, timeLeft() - 9000), []);
+  else await downloadWork;
+  let loaded = completedDownloads.slice();
   // Массовый отказ загрузок — это не «фотографий нет», а «источник перестал отвечать».
   // Разные вещи, и путать их в профиле нельзя.
   const officialTried = allRaw.filter((r) => r.source === "official_site").length;
@@ -801,7 +896,7 @@ export async function buildProfile(
   removed.overSiteLimit = Math.max(0, officialLoaded.length - limits.maxOfficialPhotos);
   loaded = [
     ...officialLoaded.slice(0, limits.maxOfficialPhotos),
-    ...loaded.filter((l) => l.raw.source === "google_places"),
+    ...loaded.filter((l) => l.raw.source !== "official_site"),
   ];
   onProgress({
     stage: "prefilter",
@@ -831,13 +926,72 @@ export async function buildProfile(
 
   // 6. Vision: что изображено. Батчи по BATCH_SIZE, ошибки не роняют профиль.
   const visionInputs: VisionInput[] = kept.map((k) => ({ id: k.raw.id, bytes: k.img.bytes, mime: k.img.mime }));
-  onProgress({ stage: "vision", batches: Math.ceil(visionInputs.length / BATCH_SIZE) });
+  onProgress({ stage: "vision", batches: mode === "quick" ? 0 : Math.ceil(visionInputs.length / BATCH_SIZE) });
   let verdicts = new Map<string, VisionVerdict>();
   let visionErrors: string[] = [];
   if (process.env.GEMINI_API_KEY) {
-    const r = await classifyImages(visionInputs, { universityName: university.label, city: university.city });
-    verdicts = r.verdicts;
-    visionErrors = r.errors;
+    const context = { universityName: university.label, city: university.city };
+    if (mode === "quick") {
+      // One candidate per still-empty category per round. A vision verdict may move a
+      // photo to another category; only actual verdicts count toward coverage.
+      const attempted = new Set<string>();
+      const covered = new Set<Category>();
+      const queues = new Map<Category, Loaded[]>(QUICK_CATEGORIES.map((c) => [c, kept.filter((k) => k.raw.category === c)]));
+      const officialExtras = kept.filter((k) => k.raw.source === "official_site").slice(1, 5);
+      for (let round = 0; round < 3 && timeLeft() > 2500; round++) {
+        const selection: Loaded[] = [];
+        for (const category of QUICK_CATEGORIES) {
+          if (covered.has(category)) continue;
+          const candidate = queues.get(category)?.find((k) => !attempted.has(k.raw.id));
+          if (candidate) selection.push(candidate);
+        }
+        // Official pages have no reliable category metadata. Inspect a few as
+        // wildcards while some categories remain empty.
+        if (round > 0 && covered.size < QUICK_CATEGORIES.length) {
+          const extra = officialExtras.find((k) => !attempted.has(k.raw.id));
+          if (extra && !selection.includes(extra)) selection.push(extra);
+        }
+        if (!selection.length) break;
+        selection.forEach((k) => attempted.add(k.raw.id));
+        const inputs = selection.map((k) => ({ id: k.raw.id, bytes: k.img.bytes, mime: k.img.mime }));
+        const aiBudgetMs = Math.max(0, timeLeft() - 500);
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), aiBudgetMs);
+        const result = await classifyImages(inputs, context, { concurrency: 2, retry: false, signal: controller.signal });
+        clearTimeout(timeout);
+        result.verdicts.forEach((v, id) => {
+          verdicts.set(id, v);
+          if (!v.relevant || v.category === "other") return;
+          const candidate = selection.find((k) => k.raw.id === id);
+          if (!candidate) return;
+          const raw = candidate.raw;
+          const category = categoryFromEvidence(raw, v);
+          if (category === "other" || !QUICK_CATEGORIES.includes(category)) return;
+          const trust = v.confidence === "low" ? downgrade(raw.trust) : raw.trust;
+          if (trust !== "unverified") covered.add(category);
+          const reasons = [...raw.evidence.reasons,
+            `Содержимое проверено (Gemini, уверенность ${v.confidence}): ${v.caption}`,
+            ...(category !== v.category ? [`На фото виден фасад; тип здания подтверждён названием места «${raw.evidence.placeName}»`] : []),
+            ...(category !== raw.category ? [`Категория по содержимому: «${category}» (по запросу было «${raw.category}»)`] : []),
+          ];
+          onProgress({ stage: "photo", photo: {
+            id: raw.id, source: raw.source, imageUrl: raw.imageUrl,
+            sourceUrl: raw.sourceUrl, attribution: raw.attribution, license: raw.license,
+            publishedAt: raw.publishedAt, retrievedAt: new Date().toISOString(),
+            category, trust,
+            evidence: { ...raw.evidence, vision: v, reasons },
+            widthPx: raw.widthPx || candidate.img.width,
+            heightPx: raw.heightPx || candidate.img.height,
+            hash: candidate.hash,
+          } });
+        });
+        visionErrors.push(...result.errors);
+      }
+    } else {
+      const r = await classifyImages(visionInputs, context);
+      verdicts = r.verdicts;
+      visionErrors = r.errors;
+    }
   } else {
     warnings.push("Ключ GEMINI_API_KEY не задан — содержимое снимков не проверялось, доверие ограничено уровнем «вероятно»");
   }
@@ -851,6 +1005,14 @@ export async function buildProfile(
   for (const k of kept) {
     const raw = k.raw;
     const v = verdicts.get(raw.id) ?? null;
+    // Quick Board never shows a photo whose content check did not finish.
+    if (mode === "quick" && !v) continue;
+    // Связанная категория Commons означает «файл имеет отношение к вузу», а не
+    // «на нём кампус». Без проверки содержимого такой снимок не показываем.
+    if (raw.source === "wikimedia_commons" && !v) {
+      removed.irrelevant++;
+      continue;
+    }
     let category = raw.category;
     let trust = raw.trust;
     const reasons = [...raw.evidence.reasons];
@@ -860,17 +1022,19 @@ export async function buildProfile(
         removed.irrelevant++;
         continue;
       }
+      const evidenceCategory = categoryFromEvidence(raw, v);
       if (raw.category === "citywide" && v.category === "city") {
         // Модель не различает «рядом с кампусом» и «город»: и там, и там улица.
         // Снимок пришёл из городского запроса, и модель подтвердила, что это город —
         // значит, категорию определяет география, а не содержимое.
         reasons.push("Содержимое подтверждено как городская сцена; отнесено к городу, а не к окружению кампуса, по запросу и расстоянию");
-      } else if (v.category !== raw.category) {
-        reasons.push(`Категория по содержимому: «${v.category}» (по запросу было «${raw.category}»)`);
-        category = v.category;
-      } else {
+      } else if (evidenceCategory !== raw.category) {
+        reasons.push(`Категория по содержимому: «${evidenceCategory}» (по запросу было «${raw.category}»)`);
+        category = evidenceCategory as Category;
+      } else if (evidenceCategory === v.category) {
         reasons.push(`Категория по содержимому совпала с запросом: «${category}»`);
       }
+      if (evidenceCategory !== v.category) reasons.push(`На фото виден фасад; тип здания подтверждён названием места «${raw.evidence.placeName}»`);
       reasons.push(`Содержимое проверено (Gemini, уверенность ${v.confidence}): ${v.caption}`);
       if (v.confidence === "low") {
         reasons.push("Низкая уверенность модели в содержимом — доверие понижено на один уровень");
@@ -879,6 +1043,15 @@ export async function buildProfile(
     } else {
       reasons.push("Содержимое снимка не проверено: vision недоступен — доверие ограничено уровнем «вероятно»");
       if (trust === "verified") trust = "probable";
+    }
+
+    if (mode === "quick" && !QUICK_CATEGORIES.includes(category)) continue;
+
+    // Commons не даёт проверенных координат съёмки: городская сцена из связанной
+    // категории не может автоматически стать «вокруг кампуса».
+    if (raw.source === "wikimedia_commons" && (category === "city" || category === "citywide")) {
+      removed.irrelevant++;
+      continue;
     }
 
     // Город показывают общим видом. Крупный план памятника или вывески — это не
@@ -908,6 +1081,7 @@ export async function buildProfile(
       imageUrl: raw.imageUrl,
       sourceUrl: raw.sourceUrl,
       attribution: raw.attribution,
+      license: raw.license,
       publishedAt: raw.publishedAt,
       retrievedAt: new Date().toISOString(),
       category,
@@ -998,7 +1172,7 @@ export async function buildProfile(
     : [];
 
   // 10. Итоги.
-  const [cityCenter, reviews] = await Promise.all([cityCenterPromise, reviewsPromise]);
+  const [cityCenter, reviews, deepContext] = await Promise.all([cityCenterPromise, reviewsPromise, deepContextPromise]);
   // Возраст отзывов — то немногое, что мы знаем точно. Если самый свежий отзыв
   // многолетней давности, это характеристика источника, и молчать о ней нельзя.
   const newestReview = reviews
@@ -1022,6 +1196,7 @@ export async function buildProfile(
 
   return {
     mode,
+    deepContext,
     university,
     anchor,
     cityCenter,
@@ -1035,6 +1210,7 @@ export async function buildProfile(
     sources: {
       official: photos.filter((p) => p.source === "official_site").length,
       visitors: photos.filter((p) => p.source === "google_places").length,
+      commons: photos.filter((p) => p.source === "wikimedia_commons").length,
     },
     visionAvailable,
     warnings,

@@ -27,7 +27,11 @@ const P_ADMIN = "P131";
 const P_INSTANCE = "P31";
 
 type SearchHit = { id?: string; label?: string; description?: string };
-type Snak = { mainsnak?: { datavalue?: { value?: unknown; type?: string } } };
+type Snak = {
+  rank?: "preferred" | "normal" | "deprecated";
+  qualifiers?: Record<string, unknown>;
+  mainsnak?: { datavalue?: { value?: unknown; type?: string } };
+};
 type Entity = {
   id?: string;
   labels?: Record<string, { value?: string }>;
@@ -46,7 +50,11 @@ async function callApi(params: Record<string, string>, userAgent: string): Promi
 }
 
 function firstClaim(entity: Entity, pid: string): unknown {
-  return entity.claims?.[pid]?.[0]?.mainsnak?.datavalue?.value;
+  const statements = (entity.claims?.[pid] ?? []).filter((statement) =>
+    statement.rank !== "deprecated" &&
+    ((pid !== P_COUNTRY && pid !== P_ADMIN) || !statement.qualifiers?.P582));
+  return (statements.find((statement) => statement.rank === "preferred") ?? statements[0])
+    ?.mainsnak?.datavalue?.value;
 }
 
 /** P625 приходит как { latitude, longitude, globe }. */

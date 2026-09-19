@@ -93,11 +93,11 @@ const SKIP_EXT = /\.(svg|gif|ico|bmp|css|js|woff2?|ttf|eot|mp4|webm|pdf)(\?|#|$)
  *  поэтому виртуальные туры ищем только полными словами. */
 const LINK_TIERS: Array<{ score: number; re: RegExp }> = [
   // Прямые указания на фотографии: галереи, альбомы, фотоотчёты, панорамные туры.
-  { score: 3, re: /галере|фотоальбом|фотоотч|фотохрон|альбом|gallery|photoalbum|photos?\b|album|виртуальн|virtual.?tour|3d.?tour|3d.?тур|панорам|panorama|фотосурет|суреттер|галерея/i },
+  { score: 3, re: /галере|фотоальбом|фотоотч|фотохрон|альбом|gallery|photoalbum|photos?\b|album|виртуальн|virtual.?tour|3d.?tour|3d.?тур|панорам|panorama|фотосурет|суреттер|照片|相册|相冊|图集|圖集|写真|フォト|갤러리|사진|포토/i },
   // Разделы про сами объекты вуза: там фотографии чаще всего есть.
-  { score: 2, re: /кампус|campus|студгородок|общежит|dormitor|hostel|библиотек|librar|лаборатор|laborator|инфраструктур|facilities|кітапхана|жатақхана|зертхана|асхана|спорт/i },
+  { score: 2, re: /кампус|campus|студгородок|общежит|dormitor|hostel|библиотек|librar|лаборатор|laborator|инфраструктур|facilities|кітапхана|жатақхана|зертхана|асхана|спорт|校园|校園|宿舍|图书馆|圖書館|实验室|實驗室|食堂|体育|體育|캠퍼스|기숙사|도서관|연구실|체육|キャンパス|学生寮|図書館|研究室/i },
   // Слабый признак: раздел может оказаться текстовым (новости конференций, объявления).
-  { score: 1, re: /студенческ|студентам|жизнь|student.?life|медиа|media/i },
+  { score: 1, re: /студенческ|студентам|жизнь|student.?life|student.?activit|медиа|media|学生生活|學生生活|学生活动|學生活動|학생생활|학생활동/i },
 ];
 
 /** Разделы, где фотографий заведомо нет — не тратим на них запрос. */
@@ -106,7 +106,7 @@ const SKIP_LINK = /контакт|ваканс|приём|priem|admission|док
 /** Страницы событий и новостей. Раньше они отбрасывались как «текст без фотографий»,
  *  и это стоило нам дат: у новости дата публикации есть в разметке, а у галереи её
  *  нет никогда. Плюс новость показывает вуз сегодняшний, а не десятилетней давности. */
-const NEWS_LINK = /новост|жаңалық|news|событи|іс-шара|мероприят|events?\b/i;
+const NEWS_LINK = /новост|жаңалық|news|событи|іс-шара|мероприят|events?\b|新闻|新聞|活动|活動|ニュース|イベント|소식|뉴스|행사/i;
 /** Адрес с годом — почти всегда отдельная новость, а не её список. */
 const DATED_URL = /\/20\d\d[/-]/;
 
@@ -118,12 +118,12 @@ const DATED_URL = /\/20\d\d[/-]/;
  *  фотографиях, по-прежнему решает модель, а не текст ссылки. Раздел «Библиотека»
  *  вполне может оказаться списком электронных баз без единой фотографии. */
 const CATEGORY_LINKS: Array<{ key: string; re: RegExp }> = [
-  { key: "library", re: /библиотек|кітапхана|kitapkhana|librar/i },
-  { key: "sport", re: /спорт|спорткомплекс|бассейн|стадион|sport|gym|stadium/i },
-  { key: "dorm", re: /общежит|жатақхана|zhatakhana|dormitor|hostel/i },
-  { key: "lab", re: /лаборатор|laborator/i },
-  { key: "canteen", re: /столов|асхана|ashana|буфет|canteen|cafeteria|dining/i },
-  { key: "lecture", re: /аудитори|учебн.{0,3}корпус|лекцион|classroom|lecture.?hall/i },
+  { key: "library", re: /библиотек|кітапхана|kitapkhana|librar|图书馆|圖書館|도서관|図書館/i },
+  { key: "sport", re: /спорт|спорткомплекс|бассейн|стадион|sport|gym|stadium|体育|體育|체육|スポーツ/i },
+  { key: "dorm", re: /общежит|жатақхана|zhatakhana|dormitor|hostel|宿舍|기숙사|学生寮/i },
+  { key: "lab", re: /лаборатор|laborator|实验室|實驗室|연구실|研究室/i },
+  { key: "canteen", re: /столов|асхана|ashana|буфет|canteen|cafeteria|dining|食堂|학생식당/i },
+  { key: "lecture", re: /аудитори|учебн.{0,3}корпус|лекцион|classroom|lecture.?hall|教室|강의실/i },
 ];
 
 function linkScore(haystack: string): number {
@@ -190,10 +190,31 @@ function extractImageUrls(html: string, pageUrl: string): string[] {
 
 type SiteLink = { url: string; haystack: string };
 
+/** Разрешаем только поддомены того же вуза, когда граница вуза ясна из
+ * образовательного домена. Для остальных доменов остаёмся на исходном хосте. */
+export function institutionHostRoot(hostname: string): string | null {
+  const host = hostname.toLowerCase().replace(/^www\./, "");
+  const parts = host.split(".");
+  const twoLevel = ["edu.cn", "ac.kr", "ac.jp", "edu.kz", "edu.au", "ac.uk"];
+  for (const suffix of twoLevel) {
+    if (host.endsWith(`.${suffix}`) && parts.length >= 3) return parts.slice(-3).join(".");
+  }
+  if (host.endsWith(".edu") && parts.length >= 2) return parts.slice(-2).join(".");
+  return null;
+}
+
+export function isInstitutionHost(hostname: string, officialHost: string): boolean {
+  const host = hostname.toLowerCase().replace(/^www\./, "");
+  const official = officialHost.toLowerCase().replace(/^www\./, "");
+  if (host === official) return true;
+  const root = institutionHostRoot(official);
+  return Boolean(root && (host === root || host.endsWith(`.${root}`)));
+}
+
 /** Все внутренние ссылки страницы одним проходом: адрес плюс текст ссылки,
  *  по которому дальше решается, за чем эта ссылка ведёт. */
 function extractLinks(html: string, pageUrl: string): SiteLink[] {
-  const origin = new URL(pageUrl).origin;
+  const pageHost = new URL(pageUrl).hostname;
   const out: SiteLink[] = [];
   const seen = new Set<string>();
 
@@ -204,7 +225,7 @@ function extractLinks(html: string, pageUrl: string): SiteLink[] {
     if (SKIP_LINK.test(haystack)) continue;
     try {
       const abs = new URL(href, pageUrl);
-      if (abs.origin !== origin) continue;
+      if (!(["http:", "https:"].includes(abs.protocol) && isInstitutionHost(abs.hostname, pageHost))) continue;
       abs.hash = "";
       const key = abs.toString();
       if (key === pageUrl || seen.has(key)) continue;
@@ -397,23 +418,39 @@ function isAllowedByRobots(rules: RobotsRules, url: string): boolean {
 
 type FetchedPage = { url: string; html: string };
 
-async function fetchPage(url: string, userAgent: string, timeoutMs: number): Promise<FetchedPage | { error: string }> {
+async function fetchPage(
+  url: string,
+  userAgent: string,
+  timeoutMs: number,
+  canFetch: (url: string) => Promise<boolean>,
+): Promise<FetchedPage | { error: string }> {
   try {
-    const res = await fetch(url, {
+    let current = url;
+    for (let hop = 0; hop < 4; hop++) {
+      if (!await canFetch(current)) return { error: "адрес закрыт robots.txt или не принадлежит вузу" };
+      const res = await fetch(current, {
       headers: {
         "User-Agent": userAgent,
         Accept: "text/html,application/xhtml+xml",
-        "Accept-Language": "ru,kk,en",
+        "Accept-Language": "ru,kk,en,zh,ko,ja",
       },
       signal: AbortSignal.timeout(timeoutMs),
-      redirect: "follow",
+      redirect: "manual",
     });
-    if (!res.ok) return { error: `сайт ответил HTTP ${res.status}` };
-    if (!(res.headers.get("content-type") ?? "").includes("html")) return { error: "страница не HTML" };
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get("location");
+        if (!location) return { error: "перенаправление без адреса" };
+        current = new URL(location, current).toString();
+        continue;
+      }
+      if (!res.ok) return { error: `сайт ответил HTTP ${res.status}` };
+      if (!(res.headers.get("content-type") ?? "").includes("html")) return { error: "страница не HTML" };
 
-    const raw = await res.arrayBuffer();
-    if (raw.byteLength > MAX_HTML_BYTES) return { error: "страница слишком большая" };
-    return { url: res.url || url, html: Buffer.from(raw).toString("utf8") };
+      const raw = await res.arrayBuffer();
+      if (raw.byteLength > MAX_HTML_BYTES) return { error: "страница слишком большая" };
+      return { url: current, html: Buffer.from(raw).toString("utf8") };
+    }
+    return { error: "слишком много перенаправлений" };
   } catch (e) {
     const err = e as Error & { cause?: { code?: string } };
     const code = err.cause?.code;
@@ -471,6 +508,24 @@ export async function collectOfficialImages(
   // robots.txt читаем ДО первой страницы: спрашивать разрешение после того, как уже
   // зашёл, смысла не имеет.
   const robots = await fetchRobots(origin, userAgent);
+  const officialHost = new URL(homeUrl).hostname;
+  const robotsByOrigin = new Map<string, Promise<RobotsRules>>([[origin, Promise.resolve(robots)]]);
+  const rulesFor = (url: string): Promise<RobotsRules> => {
+    const targetOrigin = new URL(url).origin;
+    let pending = robotsByOrigin.get(targetOrigin);
+    if (!pending) {
+      pending = fetchRobots(targetOrigin, userAgent);
+      robotsByOrigin.set(targetOrigin, pending);
+    }
+    return pending;
+  };
+  const canFetch = async (url: string): Promise<boolean> => {
+    const target = new URL(url);
+    if (!(["http:", "https:"].includes(target.protocol) &&
+      isInstitutionHost(target.hostname, officialHost))) return false;
+    const rules = await rulesFor(url);
+    return isAllowedByRobots(rules, url);
+  };
   const robotsNote =
     robots.source === "missing"
       ? "robots.txt на сайте нет — ограничений для обхода не заявлено"
@@ -492,7 +547,7 @@ export async function collectOfficialImages(
     };
   }
 
-  const home = await fetchPage(homeUrl, userAgent, HOME_TIMEOUT_MS);
+  const home = await fetchPage(homeUrl, userAgent, HOME_TIMEOUT_MS, canFetch);
   if ("error" in home) return { candidates: [], pagesVisited: [], blockedByRobots, robotsNote, skippedForTime: 0, error: home.error };
 
   const pages: FetchedPage[] = [home];
@@ -502,11 +557,11 @@ export async function collectOfficialImages(
   const selected = selectInnerLinks(home.html, home.url, opts.deep);
   const links: string[] = [];
   for (const l of selected) {
-    if (isAllowedByRobots(robots, l)) links.push(l);
+    if (await canFetch(l)) links.push(l);
     else blockedByRobots.push(l);
   }
 
-  const delay = robots.crawlDelayMs ?? 0;
+  const delay = Math.max(0, ...await Promise.all(links.map(async (l) => (await rulesFor(l)).crawlDelayMs ?? 0)));
   const allowedByBudget = delay > 0 ? Math.max(0, Math.floor(CRAWL_DELAY_BUDGET_MS / delay)) : links.length;
   const toVisit = links.slice(0, allowedByBudget);
   const batchSize = delay > 0 ? 1 : PAGE_CONCURRENCY;
@@ -520,7 +575,7 @@ export async function collectOfficialImages(
       break;
     }
     if (delay > 0 && i > 0) await new Promise((r) => setTimeout(r, delay));
-    const batch = await Promise.all(toVisit.slice(i, i + batchSize).map((l) => fetchPage(l, userAgent, INNER_TIMEOUT_MS)));
+    const batch = await Promise.all(toVisit.slice(i, i + batchSize).map((l) => fetchPage(l, userAgent, INNER_TIMEOUT_MS, canFetch)));
     for (const page of batch) if (!("error" in page)) pages.push(page);
   }
 
@@ -528,12 +583,13 @@ export async function collectOfficialImages(
   // занимают его целиком, и до галереи, ради которой обход и затевался, дело не доходит.
   // Правила robots.txt распространяются и на сами файлы картинок этого домена.
   // Картинки со сторонних хостов (CDN) ими не управляются: у того домена свой файл.
-  const perPage = pages.map((page) => {
+  const perPage = await Promise.all(pages.map(async (page) => {
     const published = pageDate(page.html, page.url);
+    const pageRules = await rulesFor(page.url);
     return extractImageUrls(page.html, page.url)
-      .filter((url) => !url.startsWith(origin) || isAllowedByRobots(robots, url))
+      .filter((url) => new URL(url).origin !== new URL(page.url).origin || isAllowedByRobots(pageRules, url))
       .map((url) => ({ url, pageUrl: page.url, publishedAt: published }));
-  });
+  }));
   const seen = new Set<string>();
   const candidates: OfficialCandidate[] = [];
   // Кандидатов набираем ровно столько, сколько профиль способен использовать: каждый

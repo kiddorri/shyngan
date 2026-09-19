@@ -23,6 +23,8 @@ export type Category =
   | "library"
   | "lab"
   | "sport"
+  | "canteen"
+  | "outdoor"
   | "life"
   | "city"
   | "citywide";
@@ -34,19 +36,23 @@ export const CATEGORY_LABELS: Record<Category, string> = {
   library: "Библиотека",
   lab: "Лаборатории",
   sport: "Спорт",
+  canteen: "Столовая",
+  outdoor: "Территория",
   life: "Студенческая жизнь",
   city: "Вокруг кампуса",
   citywide: "Город",
 };
 
-export const ALL_CATEGORIES: Category[] = ["campus", "lecture", "dorm", "library", "lab", "sport", "life", "city", "citywide"];
+export const QUICK_CATEGORIES: Category[] = ["campus", "lecture", "library", "sport", "canteen", "dorm", "outdoor"];
+export const ALL_CATEGORIES: Category[] = ["campus", "lecture", "library", "sport", "canteen", "dorm", "outdoor", "lab", "life", "city", "citywide"];
 
 /** Откуда снимок. official_site — опубликован на сайте вуза; google_places — загружен посетителем. */
-export type PhotoSource = "google_places" | "official_site";
+export type PhotoSource = "google_places" | "official_site" | "wikimedia_commons";
 
 export const SOURCE_LABELS: Record<PhotoSource, string> = {
   google_places: "Глазами людей",
   official_site: "Официальные",
+  wikimedia_commons: "Wikimedia Commons",
 };
 
 /** Откуда взяты координаты, относительно которых считалось расстояние. */
@@ -120,6 +126,8 @@ export type PhotoItem = {
   /** Кликабельный источник: страница места в Google Maps или страница сайта вуза. */
   sourceUrl: string | null;
   attribution: Attribution[];
+  /** У файлов Commons условия повторного использования указаны для каждого файла. */
+  license: { name: string; url: string } | null;
   /** Дата публикации, если источник её сообщил. У Google Places её нет никогда.
    *  У снимков со страниц новостей и событий вуза она есть: берётся из разметки
    *  страницы (article:published_time, <time datetime>) или из адреса вида
@@ -216,7 +224,15 @@ export type PlaceReview = {
   languageCode: string | null;
 };
 
+export type DeepContext = {
+  climate: { winterC: number; summerC: number; annualPrecipitationMm: number; years: string; sourceUrl: string } | null;
+  transport: Array<{ name: string; kind: string; distanceM: number; lat: number; lon: number }>;
+  transportSourceUrl: string | null;
+  livingCosts: { currency: string; city: string; updated: string | null; items: Array<{ label: string; average: number; unit: string }> } | null;
+};
+
 export type ProgressEvent =
+  | { stage: "photo"; photo: PhotoItem }
   | { stage: "anchor"; source: AnchorSource }
   | { stage: "places"; found: number }
   | { stage: "official"; found: number; error: string | null }
@@ -240,13 +256,16 @@ export type Profile = {
   reviews: PlaceReview[];
   /** Место, к которому относятся отзывы. */
   reviewsPlaceName: string | null;
+  deepContext?: DeepContext;
   photos: PhotoItem[];
   coverage: CategoryCoverage[];
   /** Краткое описание кампуса, собранное только из найденных данных. */
   description: string;
   removed: RemovalStats;
-  sources: { official: number; visitors: number };
+  sources: { official: number; visitors: number; commons: number };
   visionAvailable: boolean;
   warnings: string[];
   timingMs: number;
+  /** Возраст сохранённого профиля при повторном открытии. */
+  cacheAgeMs?: number;
 };
