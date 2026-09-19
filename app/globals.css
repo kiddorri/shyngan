@@ -1,36 +1,92 @@
 @import "leaflet/dist/leaflet.css";
 
+/* ============================================================================
+   Shyngan — визуальная система
+   ----------------------------------------------------------------------------
+   Продукт показывает, как выглядит университет. Значит, интерфейс обязан
+   отойти в сторону: он задаёт рамку и порядок, но не спорит с фотографией.
+   Отсюда два основания страницы, и это главное правило системы:
+
+     • БУМАГА (--paper) — всё, что читают: заголовки, описания, доказательства,
+       источники, лицензии. Светлая, спокойная, с цветами доверия в том же
+       контрасте, в каком они задумывались.
+     • ЧЕРНИЛА (--ink-deep) — всё, где есть фотография: обложка, поля снимков,
+       просмотрщик. Тёмное поле не конкурирует с кадром и не подкрашивает его,
+       в отличие от белой карточки.
+
+   Схема зафиксирована светлой и не переключается: профиль читают как документ
+   со шкалой доверия, и бейдж «подтверждено» обязан выглядеть одинаково у всех.
+   Для снимков на чернильном поле заданы отдельные значения тех же цветов —
+   это те же оттенки, поднятые по светлоте до контраста на тёмном.
+   ========================================================================== */
+
 :root {
-  --background: #dce0e8;
+  /* --- основания --- */
+  --paper: #dce0e8;
+  --paper-raised: #e7eaef;
+  --surface: #f4f5f7;
+  --ink: #27363f;
+  --ink-deep: #1d2830;
+  --ink-black: #141c22;
+
+  /* --- линии --- */
+  --line: #c3cbd2;
+  --line-strong: #8ea1ae;
+  --line-ink: rgba(220, 224, 232, 0.22);
+
+  /* --- текст --- */
   --foreground: #27363f;
+  --muted: #685652;
+  --steel: #8ea1ae;
+  --on-ink: #dfe3ea;
+  --on-ink-muted: #93a3ad;
+
+  /* --- акцент --- */
+  --accent: #6b212c;
+  --accent-warm: #8f2f3c;
+  --accent-on-ink: #d98f98;
+
+  /* --- шкала доверия на бумаге --- */
+  --verified: #1f5f55;
+  --probable: #8a5a2d;
+  --unverified: #6b212c;
+
+  /* --- та же шкала на чернилах --- */
+  --verified-ink: #7cc4b2;
+  --probable-ink: #dda56d;
+  --unverified-ink: #e2909a;
+
+  /* --- шрифты --- */
   --font-sans: "Manrope";
   --font-editorial: "Cormorant Garamond";
-}
+  --font-display: "Cormorant Garamond";
 
-.campusMapShell { border: 1px solid #bfc8ce; background: #f3f4f5; overflow: hidden; }
-.campusMapBar { min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; font-size: 13px; font-weight: 700; color: #27363f; }
-.campusMapBar button { padding: 7px 11px; border: 1px solid #8ea1ae; color: #27363f; background: white; cursor: pointer; }
-.campusMapCanvas { height: 430px; position: relative; background: #dce0e8; }
-.campusMapFallback { position: absolute; z-index: 1000; inset: 12px; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 10px; background: rgba(250,250,250,.94); text-align: center; }
-.campusMapFallback a { text-decoration: underline; color: #6b212c; }
-.campusMapPlaces { list-style: none; display: grid; grid-template-columns: repeat(auto-fit,minmax(210px,1fr)); gap: 0; }
-.campusMapPlaces li { display: flex; align-items: center; gap: 8px; border-top: 1px solid #dce0e8; padding: 11px 14px; font-size: 12px; }
-.campusMapPlaces small { margin-left: auto; white-space: nowrap; color: #685652; }
-.campusMapSwatch { width: 9px; height: 9px; border-radius: 50%; flex: none; background: #27363f; }
-.campusMapSwatchCampus { background: #6b212c; }.campusMapSwatchCity { background: #8ea1ae; }
-@media (max-width: 640px) { .campusMapCanvas { height: 340px; } .campusMapPlaces { grid-template-columns: 1fr; } }
+  /* --- ритм --- */
+  --gutter: clamp(20px, 4vw, 64px);
+  --measure: 1520px;
+  --step: clamp(56px, 7vw, 118px);
+
+  /* --- движение --- */
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+}
 
 html {
   height: 100%;
   /* Профиль читают как документ с цветовой шкалой доверия: тёмная схема меняла бы
-     контраст бейджей, поэтому схема задана явно и одинакова у всех. */
+     контраст бейджей, поэтому схема задана явно и одинакова у всех. Чернильные
+     поля под фотографиями — часть вёрстки, а не системная тёмная тема. */
   color-scheme: light;
+  scroll-behavior: smooth;
 }
 
+/* clip, а не hidden: overflow-x: hidden делает документ прокручиваемым
+   контейнером и ломает position: sticky у всего внутри — шапка и указатель
+   категорий уезжали вместе со страницей. clip подрезает так же, но контейнер
+   прокрутки не создаёт. */
 html,
 body {
   max-width: 100vw;
-  overflow-x: hidden;
+  overflow-x: clip;
 }
 
 body {
@@ -38,8 +94,11 @@ body {
   display: flex;
   flex-direction: column;
   color: var(--foreground);
-  background: var(--background);
+  background: var(--paper);
   font-family: var(--font-sans), system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  font-feature-settings: "tnum" 1, "ss01" 1;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -50,6 +109,15 @@ body {
   margin: 0;
 }
 
+/* Скруглений в системе нет: жёсткий край — часть почерка Shyngan.
+   Исключения (аватар, точка на карте) задают радиус у себя явно. */
+img,
+button,
+input,
+figure {
+  border-radius: 0;
+}
+
 a {
   color: inherit;
   text-decoration: none;
@@ -57,4 +125,172 @@ a {
 
 button {
   font-family: inherit;
+  color: inherit;
+}
+
+h1, h2, h3, h4 {
+  font-weight: 600;
+  text-wrap: balance;
+}
+
+::selection {
+  background: var(--accent);
+  color: #f2eae9;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ============================================================================
+   План кампуса. Leaflet рендерит вне CSS-модуля, поэтому классы глобальные.
+   Оформление подчинено той же системе: хайрлайны, малые капители, без скруглений.
+   ========================================================================== */
+
+.campusMapShell {
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.campusMapBar {
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px var(--gutter-sm, 18px);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--ink);
+  background: var(--paper-raised);
+  border-bottom: 1px solid var(--line);
+}
+
+.campusMapBar button {
+  padding: 9px 14px;
+  border: 1px solid var(--ink);
+  color: var(--ink);
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  transition: background 0.2s var(--ease), color 0.2s var(--ease);
+}
+
+.campusMapBar button:hover {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.campusMapCanvas {
+  height: 480px;
+  position: relative;
+  background: var(--paper);
+}
+
+.campusMapFallback {
+  position: absolute;
+  z-index: 1000;
+  inset: 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  background: rgba(244, 245, 247, 0.95);
+  text-align: center;
+  font-size: 13px;
+}
+
+.campusMapFallback a {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  color: var(--accent);
+}
+
+.campusMapPlaces {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.campusMapPlaces li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  padding: 13px 16px;
+  font-size: 12px;
+}
+
+.campusMapPlaces small {
+  margin-left: auto;
+  white-space: nowrap;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.campusMapSwatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--ink);
+}
+
+.campusMapSwatchCampus { background: var(--accent); }
+.campusMapSwatchCity { background: var(--steel); }
+
+.leaflet-container {
+  font-family: var(--font-sans), system-ui, sans-serif;
+  background: var(--paper);
+}
+
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  border-radius: 0;
+  background: var(--ink);
+  color: var(--on-ink);
+  box-shadow: none;
+}
+
+.leaflet-popup-content {
+  margin: 12px 14px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.leaflet-popup-content strong {
+  display: block;
+  font-size: 13px;
+  margin-bottom: 2px;
+}
+
+.leaflet-popup-close-button { color: var(--on-ink-muted) !important; }
+
+.leaflet-control-zoom a {
+  border-radius: 0 !important;
+  color: var(--ink) !important;
+  border-color: var(--line-strong) !important;
+}
+
+@media (max-width: 640px) {
+  .campusMapCanvas { height: 340px; }
+  .campusMapPlaces { grid-template-columns: 1fr; }
 }
