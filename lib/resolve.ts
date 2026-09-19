@@ -10,7 +10,7 @@
 // что и фотографии, поэтому независимого подтверждения у него нет. Профиль сообщает
 // об этом предупреждением, а уровни доверия понижаются обычным механизмом якоря.
 
-import { getPlaceDetails, searchText } from "./places";
+import { getPlaceDetails, searchText, type Place } from "./places";
 import type { UniversityCandidate } from "./types";
 import { getUniversityByQid, resolveUniversity, WikidataUnavailableError } from "./wikidata";
 
@@ -24,6 +24,19 @@ const MAX_PLACES_CANDIDATES = 5;
 
 function words(value: string): string[] {
   return value.normalize("NFKC").toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+/** Слабая транслитерация нужна только для сопоставления аббревиатуры с доменом:
+ *  «КазНУИ» → kaznui.edu.kz. Это не перевод названий и не источник карточки. */
+function latinSkeleton(value: string): string {
+  const map: Record<string, string> = {
+    а: "a", б: "b", в: "v", г: "g", ғ: "g", д: "d", е: "e", ё: "e", ж: "zh",
+    з: "z", и: "i", й: "i", к: "k", қ: "q", л: "l", м: "m", н: "n", ң: "n",
+    о: "o", ө: "o", п: "p", р: "r", с: "s", т: "t", у: "u", ұ: "u", ү: "u",
+    ф: "f", х: "h", һ: "h", ц: "c", ч: "ch", ш: "sh", щ: "sh", ы: "y", і: "i",
+    э: "e", ю: "yu", я: "ya", ъ: "", ь: "",
+  };
+  return [...value.toLocaleLowerCase()].map((char) => map[char] ?? char).join("");
 }
 
 function closeWord(a: string, b: string): boolean {
@@ -52,7 +65,34 @@ function nameMatchesQuery(query: string, label: string): boolean {
     const initials = name.filter((w) => !/^(of|the|and)$/.test(w)).map((w) => w[0]).join("");
     if (initials === q[0]) return true;
   }
-  return q.filter((token) => name.some((part) => closeWord(token, part))).length >= Math.ceil(q.length / 2);
+  return q.filter((token) => name.some((part) =>
+    closeWord(token, part) || closeWord(latinSkeleton(token), latinSkeleton(part)),
+  )).length >= Math.ceil(q.length / 2);
+}
+
+/** Places иногда хранит пользовательское название вуза в адресе, а аббревиатуру —
+ *  только в домене: «Шабыт» и «КазНУИ» для формального названия университета. */
+export function placeMatchesQuery(
+  query: string,
+  place: Pick<Place, "displayName" | "formattedAddress" | "websiteUri">,
+): boolean {
+  const searchable = [place.displayName?.text, place.formattedAddress, place.websiteUri]
+    .filter(Boolean)
+    .join(" ");
+  return nameMatchesQuery(query, searchable);
+}
+
+function isLikelyAcronym(value: string): boolean {
+  const letters = [...value.normalize("NFKC")].filter((char) => /\p{L}/u.test(char));
+  if (letters.length < 2 || letters.length > 10) return false;
+  const uppercase = letters.filter((char) =>
+    char === char.toLocaleUpperCase() && char !== char.toLocaleLowerCase(),
+  ).length;
+  return uppercase >= 2 && uppercase / letters.length >= 0.5;
+}
+
+function sameNormalizedName(a: string, b: string): boolean {
+  return words(a).join(" ") === words(b).join(" ");
 }
 
 function sameWebsite(a: string | null, b: string | null): boolean {
@@ -111,7 +151,7 @@ export async function resolveViaPlaces(search: string): Promise<UniversityCandid
     const places = await searchText(trimmed, options);
     return places
       .filter((p) => UNIVERSITY_NAME.test(p.displayName?.text ?? "") &&
-        nameMatchesQuery(trimmed, p.displayName?.text ?? ""))
+        placeMatchesQuery(trimmed, p))
       .map(placeToCandidate);
   } catch {
     return [];
@@ -123,7 +163,7 @@ export async function resolveViaPlaces(search: string): Promise<UniversityCandid
  * Пустой результат означает, что вуза не нашёл ни один источник.
  */
 export async function resolveAny(search: string): Promise<UniversityCandidate[]> {
-  const acronym = /^[A-Z]{2,5}$/.test(search.trim());
+  const acronym = isLikelyAcronym(search.trim());
   // Для коротких аббревиатур Wikidata часто знает другое учреждение с тем же
   // псевдонимом. Второй источник нужен всегда, поэтому не ждём первый впустую.
   const placesPromise = acronym ? resolveViaPlaces(search) : null;
@@ -156,7 +196,9 @@ export async function resolveAny(search: string): Promise<UniversityCandidate[]>
   if (!wikidataError && suggested && suggested.label.toLocaleLowerCase() !== search.trim().toLocaleLowerCase()) {
     try {
       const verified = await resolveUniversity(suggested.label);
-      const match = verified.find((c) => sameWebsite(c.officialWebsite, suggested.officialWebsite));
+      const match = verified.find((c) =>
+        sameWebsite(c.officialWebsite, suggested.officialWebsite) || sameNormalizedName(c.label, suggested.label),
+      );
       if (match) {
         return [match, ...fromWikidata.filter((c) => c.qid !== match.qid)];
       }

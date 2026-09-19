@@ -212,7 +212,21 @@ export function isInstitutionHost(hostname: string, officialHost: string): boole
   const official = officialHost.toLowerCase().replace(/^www\./, "");
   if (host === official) return true;
   const root = institutionHostRoot(official);
-  return Boolean(root && (host === root || host.endsWith(`.${root}`)));
+  if (root && (host === root || host.endsWith(`.${root}`))) return true;
+
+  // Официальные сайты иногда меняют доменную зону при редиректе: kbtu.kz →
+  // kbtu.edu.kz. Разрешаем это только при совпадении уникальной доменной метки;
+  // kbtu.evil.com не пройдёт, потому что её регистрируемая метка — evil.
+  const academicSuffixOf = (value: string): string | undefined =>
+    ["edu.kz", "edu.cn", "ac.kr", "ac.jp", "edu.au", "ac.uk"]
+      .find((suffix) => value.endsWith(`.${suffix}`));
+  const brand = (value: string): string => {
+    const parts = value.split(".");
+    const academicSuffix = academicSuffixOf(value);
+    return academicSuffix && parts.length >= 3 ? parts.at(-3)! : parts.length >= 2 ? parts.at(-2)! : parts[0];
+  };
+  const officialBrand = brand(official);
+  return Boolean(academicSuffixOf(host)) && officialBrand.length >= 4 && brand(host) === officialBrand;
 }
 
 /** Все внутренние ссылки страницы одним проходом: адрес плюс текст ссылки,

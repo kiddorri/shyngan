@@ -52,6 +52,14 @@ assert.ok(hamming(hA, hAc) <= 10, `copy should be near-duplicate, got ${hamming(
 assert.ok(hamming(hA, hB) > 10, `different images should differ, got ${hamming(hA, hB)}`);
 console.log("dHash ok:", { copy: hamming(hA, hAc), different: hamming(hA, hB) });
 
+const { placeMatchesQuery } = await import("./lib/resolve.ts");
+assert.equal(placeMatchesQuery("КазНУИ Шабыт", {
+  displayName: { text: "Казахский национальный университет искусств" },
+  formattedAddress: "Дворец творчества Шабыт, Астана",
+  websiteUri: "https://kaznui.edu.kz/",
+}), true, "неофициальное имя и кириллическая аббревиатура должны находиться через адрес и домен");
+console.log("алиасы вуза ok");
+
 // ---- 2. мок сети ----
 const captured: { gemini: any[]; twogis: string[]; places: any[] } = { gemini: [], twogis: [], places: [] };
 
@@ -386,7 +394,10 @@ for (const [url, kind] of kinds) {
 }
 
 // ---- 3. official.ts ----
-const { collectOfficialImages } = await import("./lib/official.ts");
+const { collectOfficialImages, isInstitutionHost } = await import("./lib/official.ts");
+assert.equal(isInstitutionHost("kbtu.edu.kz", "kbtu.kz"), true, "официальный перенос домена должен поддерживаться");
+assert.equal(isInstitutionHost("kbtu.evil.com", "kbtu.kz"), false, "совпадение поддомена чужого сайта недопустимо");
+assert.equal(isInstitutionHost("evil.kbtu.com", "kbtu.kz"), false, "одноимённый сторонний домен недопустим");
 const off = await collectOfficialImages("https://example.edu", "t");
 assert.equal(off.error, null);
 const offUrls = off.candidates.map((c) => c.url);
@@ -567,7 +578,7 @@ console.log("план кампуса ok:", profile.mapPoints.length, "мест")
 const second = profile.photos.find((p) => p.id === "places/P_CAMPUS2/photos/g");
 assert.ok(second, "снимок второго корпуса потерян");
 assert.equal(second!.trust, "probable", "дальний корпус с совпадающим названием — «вероятно»");
-assert.ok(second!.evidence.reasons.some((r) => r.includes("Название места совпадает с названием вуза")), JSON.stringify(second!.evidence.reasons));
+assert.ok(second!.evidence.reasons.some((r) => r.includes("Название или сайт места связывает его с вузом")), JSON.stringify(second!.evidence.reasons));
 console.log("второй корпус ok:", second!.evidence.distanceM, "м,", second!.trust);
 
 // Дополнительная функция: отзывы с настоящей датой публикации.
@@ -596,17 +607,16 @@ for (const [url, category] of [["/img/lib.jpg", "library"], ["/img/canteen.jpg",
 const fromGallery = profile.photos.find((p) => p.sourceUrl?.endsWith("/gallery"));
 assert.ok(fromGallery && fromGallery.source === "official_site", "ни один снимок из внутренней галереи не дошёл до профиля");
 console.log("снимок из галереи в профиле:", fromGallery!.evidence.reasons[0]);
-// Снимок «город», найденный запросом про учебный корпус, переразмечен по содержимому
+// Чужой учебный корпус не проходит проверку принадлежности ещё до скачивания фото.
 const cityPhoto = profile.photos.find((p) => p.id === "places/P_LECTURE/photos/c");
-assert.ok(cityPhoto && cityPhoto.category === "city", "city photo should be recategorized");
-assert.ok(cityPhoto!.evidence.reasons.some((r) => r.includes("Категория по содержимому")));
+assert.equal(cityPhoto, undefined, "место без связи с вузом не должно попадать в профиль по тематическому запросу");
 // Официальное фото: verified, provenance по домену, vision применён
 const offPhoto = profile.photos.find((p) => p.source === "official_site");
 assert.ok(offPhoto && offPhoto.trust === "verified" && offPhoto.evidence.vision);
 assert.ok(offPhoto!.evidence.reasons[0].includes("example.edu"));
-// Общежитие рядом с вузом, но без совпадения имени/домена → probable.
+// Близость сама по себе не доказывает принадлежность: чужое общежитие исключается.
 const dorm = profile.photos.find((p) => p.id === "places/P_DORM/photos/b");
-assert.ok(dorm && dorm.trust === "probable" && dorm.category === "dorm", JSON.stringify(dorm?.evidence));
+assert.equal(dorm, undefined, "объект без связи с вузом не должен попадать в профиль");
 // Кампус (источник якоря) при подтверждении 2ГИС → probable
 const campus = profile.photos.find((p) => p.id === "places/P_CAMPUS/photos/a");
 assert.ok(campus && campus.trust === "probable", JSON.stringify(campus?.evidence));

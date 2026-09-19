@@ -180,26 +180,38 @@ function assessTrust(
   anchorPlaceId: string | null,
   universityLabel: string,
   universityWebsite: string | null,
-): { trust: TrustTier; distanceM: number | null; reasons: string[] } {
+): { trust: TrustTier; distanceM: number | null; reasons: string[]; affiliated: boolean } {
   const reasons: string[] = [`Место найдено через Google Places (place_id ${place.id})`];
 
-  if (anchorPlaceId && place.id === anchorPlaceId) {
+  const siteMatches = (() => {
+    if (!place.websiteUri || !universityWebsite) return false;
+    try {
+      const a = new URL(place.websiteUri).hostname.replace(/^www\./, "");
+      const b = new URL(universityWebsite).hostname.replace(/^www\./, "");
+      return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+    } catch { return false; }
+  })();
+  const nameMatches = nameLooksLikeUniversity(place.displayName?.text ?? "", universityLabel);
+  const isAnchorPlace = Boolean(anchorPlaceId && place.id === anchorPlaceId);
+  const affiliated = isAnchorPlace || siteMatches || nameMatches;
+
+  if (isAnchorPlace) {
     if (anchor?.source === "places+2gis") {
       reasons.push("Это место — источник якорных координат; его расположение независимо подтверждено 2ГИС");
-      return { trust: "probable", distanceM: null, reasons };
+      return { trust: "probable", distanceM: null, reasons, affiliated };
     }
     reasons.push("Якорные координаты взяты из этого же места — расстояние с ним ничего не подтверждает");
     reasons.push("Независимой географической проверки нет: место найдено только по совпадению названия");
-    return { trust: "unverified", distanceM: null, reasons };
+    return { trust: "unverified", distanceM: null, reasons, affiliated };
   }
 
   if (!anchor) {
     reasons.push("Якорных координат нет — расстояние не проверялось");
-    return { trust: "unverified", distanceM: null, reasons };
+    return { trust: "unverified", distanceM: null, reasons, affiliated };
   }
   if (!place.location) {
     reasons.push("У места нет координат в Places — расстояние не проверялось");
-    return { trust: "unverified", distanceM: null, reasons };
+    return { trust: "unverified", distanceM: null, reasons, affiliated };
   }
 
   const distanceM = haversineM(anchor.lat, anchor.lon, place.location.latitude, place.location.longitude);
@@ -207,36 +219,29 @@ function assessTrust(
 
   let trust: TrustTier;
   if (distanceM <= VERIFIED_RADIUS_M) {
-    trust = "verified";
     reasons.push(`Расстояние до кампуса ${distanceM} м (порог ${VERIFIED_RADIUS_M} м)`);
-    // Близость к кампусу подтверждает район, но рядом бывают чужие учреждения.
-    // Для бейджа «Подтверждено» нужен ещё признак принадлежности самого места.
-    const siteMatches = (() => {
-      if (!place.websiteUri || !universityWebsite) return false;
-      try {
-        const a = new URL(place.websiteUri).hostname.replace(/^www\./, "");
-        const b = new URL(universityWebsite).hostname.replace(/^www\./, "");
-        return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
-      } catch { return false; }
-    })();
-    if (siteMatches) reasons.push("Сайт места находится на домене университета");
-    else if (nameLooksLikeUniversity(place.displayName?.text ?? "", universityLabel)) {
-      reasons.push("Название места совпадает с названием университета");
+    if (siteMatches || nameMatches) {
+      trust = "verified";
+      reasons.push(siteMatches
+        ? "Сайт места находится на домене университета"
+        : "Название места совпадает с названием университета");
     } else {
-      trust = "probable";
-      reasons.push("Место рядом с кампусом, но его название и сайт не подтверждают принадлежность университету");
+      trust = "unverified";
+      reasons.push("Место рядом, но его название и сайт не связывают его с университетом — фотографии объекта исключаются");
     }
   } else if (distanceM <= PROBABLE_RADIUS_M) {
-    trust = "probable";
-    reasons.push(`Расстояние до кампуса ${distanceM} м — дальше ${VERIFIED_RADIUS_M} м, но в пределах ${PROBABLE_RADIUS_M} м`);
+    trust = affiliated ? "probable" : "unverified";
+    reasons.push(affiliated
+      ? `Расстояние до кампуса ${distanceM} м; принадлежность поддержана названием или сайтом места`
+      : `Расстояние до кампуса ${distanceM} м, но название и сайт не связывают место с университетом — фотографии объекта исключаются`);
   } else {
     trust = "unverified";
     reasons.push(`Расстояние до кампуса ${distanceM} м — дальше порога ${PROBABLE_RADIUS_M} м`);
     // У вуза бывает несколько корпусов в разных концах города. Совпадение названия —
     // не доказательство (тёзки существуют), но и молчать о нём нечестно.
-    if (nameLooksLikeUniversity(place.displayName?.text ?? "", universityLabel)) {
+    if (affiliated) {
       trust = "probable";
-      reasons.push("Название места совпадает с названием вуза — вероятно, другой корпус; географически это не подтверждено");
+      reasons.push("Название или сайт места связывает его с вузом — вероятно, другой корпус; географически это не подтверждено");
     }
   }
 
@@ -267,7 +272,7 @@ function assessTrust(
     trust = downgrade(trust);
   }
 
-  return { trust, distanceM, reasons };
+  return { trust, distanceM, reasons, affiliated };
 }
 
 // ---- Принадлежность городу (для категории «Город») ----
@@ -368,10 +373,15 @@ async function placeToRaw(
   const photos = (place.photos ?? []).slice(0, perPlace);
   if (photos.length === 0) return [];
 
-  const { trust, distanceM, reasons } =
+  const assessment =
     category === "citywide"
-      ? assessCityTrust(place, anchor, cityName, campusCity)
+      ? { ...assessCityTrust(place, anchor, cityName, campusCity), affiliated: true }
       : assessTrust(place, anchor, anchorPlaceId, universityLabel, universityWebsite);
+  const { trust, distanceM, reasons, affiliated } = assessment;
+  // Поисковая релевантность Places и близость к кампусу сами по себе не доказывают,
+  // что библиотека, спортзал или общежитие принадлежат вузу. Публичное окружение и
+  // город проверяются отдельно, а неподтверждённые вузовские объекты не скачиваем.
+  if (category !== "city" && category !== "citywide" && !affiliated) return [];
   const placeName = place.displayName?.text ?? place.id;
   const uris = await Promise.all(photos.map((p) => getPhotoUri(p.name, 800, signal)));
 
