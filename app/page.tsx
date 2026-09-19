@@ -23,6 +23,7 @@ import {
   QUICK_CATEGORIES,
   CATEGORY_LABELS,
   type Category,
+  type CollectionStats,
   type PhotoItem,
   type PlaceReview,
   type Profile,
@@ -74,6 +75,8 @@ function progressText(e: ProgressEvent): string {
   switch (e.stage) {
     case "photo":
       return `Проверено фото: ${CATEGORY_LABELS[e.photo.category]}`;
+    case "stats":
+      return `Найдено ${e.discovered} · проверено ${e.checked} · добавлено ${e.accepted}`;
     case "anchor":
       return e.source === "none" ? "Координаты кампуса не найдены" : `Якорь координат: ${ANCHOR_LABELS[e.source] ?? e.source}`;
     case "places":
@@ -151,6 +154,8 @@ function stepOf(stage: ProgressEvent["stage"] | null): number {
     case "vision":
     case "photo":
       return 3;
+    case "stats":
+      return 2;
     case "done":
       return 4;
   }
@@ -288,10 +293,10 @@ function Reviews({ reviews, placeName }: { reviews: PlaceReview[]; placeName: st
 }
 
 /**
- * Быстрый взгляд: по одному-двум снимкам на категорию, всё на одном экране.
+ * Быстрый взгляд: максимум проверенных снимков за 30 секунд, всё на одном экране.
  *
  * Здесь профиль сгруппирован по категориям, а не по источнику: задача этого экрана —
- * показать, как вуз выглядит целиком, за несколько секунд. Разбор по происхождению
+ * показать, как вуз выглядит целиком, за ограниченный бюджет времени. Разбор по происхождению
  * снимков ждёт в полном профиле, но уровень доверия виден и тут: скрывать его нельзя
  * ни на каком экране.
  */
@@ -367,6 +372,9 @@ export default function Home() {
   const [loading, setLoading] = useState<"idle" | "resolve" | "profile">("idle");
   const [progress, setProgress] = useState<string[]>([]);
   const [stage, setStage] = useState<ProgressEvent["stage"] | null>(null);
+  const [collectionStats, setCollectionStats] = useState<CollectionStats | null>(null);
+  const [quickDeadlineAt, setQuickDeadlineAt] = useState<number | null>(null);
+  const [quickSecondsLeft, setQuickSecondsLeft] = useState(30);
   const [lastQid, setLastQid] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -381,8 +389,15 @@ export default function Home() {
     return () => window.removeEventListener("keydown", onKey);
   }, [selected]);
 
+  useEffect(() => {
+    if (!quickDeadlineAt) return;
+    const tick = () => setQuickSecondsLeft(Math.max(0, Math.ceil((quickDeadlineAt - Date.now()) / 1000)));
+    tick();
+    const timer = window.setInterval(tick, 250);
+    return () => window.clearInterval(timer);
+  }, [quickDeadlineAt]);
+
   async function runSearch(text: string) {
-    const searchStartedAt = Date.now();
     setError(null);
     setProfile(null);
     setWorkingUniversity(null);
@@ -412,7 +427,7 @@ export default function Home() {
         candidates[0].resolvedVia !== "places" &&
         (candidates[0].officialWebsite ||
           (candidates[0].lat !== null && candidates[0].lon !== null))) {
-        await loadProfile(candidates[0].qid, "quick", searchStartedAt);
+        await loadProfile(candidates[0].qid, "quick");
       } else {
         setCandidates(candidates);
       }
@@ -428,11 +443,12 @@ export default function Home() {
     await runSearch(query);
   }
 
-  async function loadProfile(qid: string, mode: "quick" | "deep" = "quick", startedAt = Date.now()) {
+  async function loadProfile(qid: string, mode: "quick" | "deep" = "quick") {
     setError(null);
     setCandidates([]);
     setProgress([]);
     setStage(null);
+    setCollectionStats(null);
     setLoading("profile");
     setLastQid(qid);
     // При углублении уже показанный профиль остаётся на экране: пользователь нажал
@@ -445,11 +461,12 @@ export default function Home() {
         setCatFilter("all");
         return;
       }
-      const res = await fetch(`/api/profile?qid=${qid}&mode=${mode}&startedAt=${startedAt}`);
+      const res = await fetch(`/api/profile?qid=${qid}&mode=${mode}`);
       if (!res.ok || !res.body) {
         const json = (await res.json().catch(() => ({}))) as { error?: string };
         throw new Error(json.error ?? `HTTP ${res.status}`);
       }
+      if (mode === "quick") setQuickDeadlineAt(Date.now() + 30_000);
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -465,10 +482,24 @@ export default function Home() {
           const msg = JSON.parse(line) as { type: string } & Record<string, unknown>;
           if (msg.type === "progress") {
             const event = msg as unknown as ProgressEvent;
-            setStage(event.stage);
+            if (event.stage === "stats") {
+              setCollectionStats({
+                discovered: event.discovered,
+                downloaded: event.downloaded,
+                checked: event.checked,
+                accepted: event.accepted,
+              });
+            } else {
+              setStage(event.stage);
+            }
             if (event.stage === "photo") {
               setQuickPhotos((prev) => prev.some((p) => p.id === event.photo.id) ? prev : [...prev, event.photo]);
-            } else {
+              if (mode === "deep") {
+                setProfile((prev) => prev && !prev.photos.some((photo) => photo.id === event.photo.id)
+                  ? { ...prev, photos: [...prev.photos, event.photo] }
+                  : prev);
+              }
+            } else if (event.stage !== "stats") {
               setProgress((prev) => [...prev, progressText(event)]);
             }
           } else if (msg.type === "university") {
@@ -487,6 +518,7 @@ export default function Home() {
     } catch (err) {
       setError((err as Error).message);
     } finally {
+      setQuickDeadlineAt(null);
       setLoading("idle");
     }
   }
@@ -557,8 +589,15 @@ export default function Home() {
         {loading === "profile" && (
           <div className={styles.progress}>
             <div className={styles.progressTitle}>
-              {profile ? "Собираю подробный профиль" : "Проверяю фотографии и заполняю визуальный борд"}
+              {profile
+                ? "Собираю подробный профиль"
+                : `Проверяю фотографии и заполняю визуальный борд · до ${quickSecondsLeft} с`}
             </div>
+            {collectionStats && (
+              <p className={styles.progressMetrics}>
+                Найдено {collectionStats.discovered} · загружено {collectionStats.downloaded} · проверено {collectionStats.checked} · добавлено {collectionStats.accepted}
+              </p>
+            )}
             <Steps current={stepOf(stage)} />
             <ul className={styles.progressList}>
               {progress.map((line, i) => <li key={i}>{line}</li>)}
@@ -586,7 +625,9 @@ export default function Home() {
             <div className={styles.liveBoardHead}>
               <span className={styles.eyebrow}>QUICK VISUAL BOARD</span>
               <h2 className={styles.sectionTitle}>{workingUniversity.label}</h2>
-              <p>{quickPhotos.length > 0 ? `${quickPhotos.length} проверенных фото уже доступно. Остальные категории ещё собираются.` : "Ищем фотографии в нескольких источниках…"}</p>
+              <p>{quickPhotos.length > 0
+                ? `${quickPhotos.length} проверенных фото уже доступно. Продолжаем поиск ещё до ${quickSecondsLeft} с.`
+                : `Ищем фотографии в нескольких источниках — ещё до ${quickSecondsLeft} с.`}</p>
             </div>
             <QuickBoard photos={quickPhotos} onOpen={setSelected} />
           </section>
@@ -614,6 +655,9 @@ export default function Home() {
                   {profile.photos.length} фото {profile.cacheAgeMs !== undefined
                     ? "из кэша"
                     : `за ${(profile.timingMs / 1000).toFixed(1)} с`}
+                </span>
+                <span className={styles.dot}>
+                  {profile.stopReason === "deadline_reached" ? "остановлено по лимиту времени" : "доступные источники исчерпаны"}
                 </span>
                 {profile.cityCenter && (
                   <span className={styles.dot}>

@@ -27,7 +27,6 @@ export async function GET(req: Request): Promise<Response> {
   // Быстрый взгляд — по умолчанию: он дешевле и укладывается в несколько секунд.
   // Полный сбор запускается только по явной просьбе пользователя.
   const mode = params.get("mode") === "deep" ? "deep" : "quick";
-  const clientStartedAt = Number(params.get("startedAt"));
 
   // Идентификатор вуза: QID из Wikidata либо places:<place_id> для вузов вне Wikidata.
   if (!/^Q\d+$/.test(qid) && !/^places:[\w-]+$/.test(qid)) {
@@ -68,10 +67,14 @@ export async function GET(req: Request): Promise<Response> {
       const send = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
       send({ type: "university", university });
       try {
-        const elapsedSinceSearch = Number.isFinite(clientStartedAt) && clientStartedAt > 0 && clientStartedAt <= Date.now()
-          ? Date.now() - clientStartedAt : 0;
-        const quickBudgetMs = Math.max(3000, 29_000 - elapsedSinceSearch);
-        const profile = await buildProfile(university, (e: ProgressEvent) => send({ type: "progress", ...e }), mode, quickBudgetMs);
+        const quickSeed = mode === "deep" ? cachedProfile(qid, "quick")?.profile : undefined;
+        const profile = await buildProfile(
+          university,
+          (e: ProgressEvent) => send({ type: "progress", ...e }),
+          mode,
+          30_000,
+          quickSeed,
+        );
         saveProfile(profile);
         send({ type: "profile", ...profile });
       } catch (e) {

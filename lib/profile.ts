@@ -17,7 +17,8 @@ import { dHash, hamming, loadImage, sharpness, type LoadedImage } from "./image"
 import { chooseAnchor, AGREEMENT_RADIUS_M, type LocationObservation } from "./location";
 import { collectOfficialImages, type OfficialResult } from "./official";
 import { findCityCenter } from "./osm";
-import { getPhotoUri, getPlaceReviews, searchText, type Place } from "./places";
+import { getPhotoUri, getPlaceReviews, searchText, searchTextPages, type Place } from "./places";
+import { profileSession } from "./profile-session";
 import { findInTwoGis } from "./twogis";
 import { BATCH_SIZE, classifyImages, type VisionInput } from "./vision";
 import {
@@ -51,26 +52,14 @@ const NEIGHBORHOOD_BIAS_RADIUS_M = 2000;
 
 /** Кейс прямо говорит: пятнадцать проверенных снимков ценнее сотни случайных.
  *  Отсюда все лимиты ниже: они режут не качество, а повторы одного и того же. */
-const PHOTOS_PER_PLACE = 2;
-/** Для окружения — один кадр с места. Два снимка одного кафе не добавляют ничего:
- *  это по-прежнему одно кафе, а место в профиле занято. */
-const CITY_PHOTOS_PER_PLACE = 1;
+const PHOTOS_PER_PLACE = 10;
 /** Потолок на категорию. Шесть кадров общежития снаружи — это не «покрытие
  *  категории», а один и тот же дом с разных сторон. */
-const MAX_PER_CATEGORY = 6;
 /** Порог резкости (дисперсия лапласиана, см. lib/image.ts). Взят с большим запасом:
  *  на калибровке резкий кадр даёт ~1000, сильно размытый — единицы и десятки,
  *  однотонная заливка — ноль. Всё, что ниже, показывать бессмысленно: там нечего
  *  рассматривать. Отсеянное считается отдельной строкой, чтобы порог было видно. */
 const SHARPNESS_MIN = 20;
-const MAX_PLACES_PHOTOS = 30;
-/** Снимков с сайта вуза берём больше, чем раньше: обход стал целевым, и десяти
- *  слотов не хватает, чтобы в профиль попали и библиотека, и спортзал, и столовая. */
-const MAX_OFFICIAL_PHOTOS = 14;
-/** Окружение — контекст, а не кампус: держим его небольшим, чтобы оно не забивало профиль. */
-const MAX_CITY_PHOTOS = 3;
-/** Снимков города — немного: кейс требует показать город, но профиль остаётся про вуз. */
-const MAX_CITYWIDE_PHOTOS = 4;
 /** Радиус поиска по городу: центр может быть в десятке километров от кампуса. */
 const CITY_BIAS_RADIUS_M = 20000;
 /** Дальше этого расстояния от кампуса место считается уже не этим городом.
@@ -99,9 +88,7 @@ type QueryPlanItem = {
   pageSize: number;
   /** Радиус locationBias. По умолчанию SEARCH_BIAS_RADIUS_M. */
   biasRadiusM?: number;
-  /** Входит ли запрос в быстрый взгляд. Быстрый спрашивает по одному запросу на
-   *  категорию — этого хватает, чтобы показать вуз целиком, и не хватает, чтобы
-   *  потратить полминуты. */
+  /** Входит ли запрос в быстрый взгляд. */
   quick?: boolean;
 };
 
@@ -375,8 +362,9 @@ async function placeToRaw(
   universityLabel: string,
   universityWebsite: string | null,
   photosPerPlace: number,
+  signal?: AbortSignal,
 ): Promise<RawPhoto[]> {
-  const perPlace = category === "city" || category === "citywide" ? CITY_PHOTOS_PER_PLACE : photosPerPlace;
+  const perPlace = category === "city" || category === "citywide" ? Math.min(photosPerPlace, 3) : photosPerPlace;
   const photos = (place.photos ?? []).slice(0, perPlace);
   if (photos.length === 0) return [];
 
@@ -385,7 +373,7 @@ async function placeToRaw(
       ? assessCityTrust(place, anchor, cityName, campusCity)
       : assessTrust(place, anchor, anchorPlaceId, universityLabel, universityWebsite);
   const placeName = place.displayName?.text ?? place.id;
-  const uris = await Promise.all(photos.map((p) => getPhotoUri(p.name)));
+  const uris = await Promise.all(photos.map((p) => getPhotoUri(p.name, 800, signal)));
 
   const out: RawPhoto[] = [];
   photos.forEach((p, i) => {
@@ -455,14 +443,24 @@ function freshnessRank(publishedAt: string | null): number {
  *  небольшая атака: при повторных сборах сайт начинал отвечать отказом, и профиль
  *  оставался пустым. Вежливость здесь не только этика, но и работоспособность. */
 const DOWNLOAD_CONCURRENCY = 6;
-/** В быстром взгляде медленный сайт не должен задерживать уже найденные снимки Places. */
-const QUICK_OFFICIAL_BUDGET_MS = 6500;
-const QUICK_TOTAL_BUDGET_MS = 28000;
+const QUICK_TOTAL_BUDGET_MS = 30_000;
+const DEEP_TOTAL_BUDGET_MS = 165_000;
 
-async function withDeadline<T>(promise: Promise<T>, remainingMs: number, fallback: T): Promise<T> {
-  if (remainingMs <= 0) return fallback;
+async function withDeadline<T>(
+  promise: Promise<T>,
+  remainingMs: number,
+  fallback: T,
+  onTimeout?: () => void,
+): Promise<T> {
+  if (remainingMs <= 0) {
+    onTimeout?.();
+    return fallback;
+  }
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(fallback), remainingMs);
+    const timer = setTimeout(() => {
+      onTimeout?.();
+      resolve(fallback);
+    }, remainingMs);
     promise.then(
       (value) => { clearTimeout(timer); resolve(value); },
       () => { clearTimeout(timer); resolve(fallback); },
@@ -471,11 +469,16 @@ async function withDeadline<T>(promise: Promise<T>, remainingMs: number, fallbac
 }
 
 /** Выполняет задачи пачками по limit штук, сохраняя порядок результатов. */
-async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+async function mapWithLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+  signal?: AbortSignal,
+): Promise<R[]> {
   const out = new Array<R>(items.length);
   let cursor = 0;
   async function worker() {
-    while (cursor < items.length) {
+    while (cursor < items.length && !signal?.aborted) {
       const i = cursor++;
       out[i] = await fn(items[i]);
     }
@@ -520,29 +523,24 @@ function computeCoverage(photos: PhotoItem[]): CategoryCoverage[] {
 // ---- Главная функция ----
 
 /** Пределы, различающиеся между быстрым взглядом и полным сбором.
- *  Быстрый должен показать вуз целиком и сразу: по одному-два снимка на категорию.
- *  Полный — дать материал тем, кто нажал «подробнее». */
+ *  Они задают глубину одного места; итог ограничивают дедлайн, качество и дубликаты. */
 function limitsFor(mode: ProfileMode) {
   return mode === "quick"
     ? {
-        photosPerPlace: 1,
-        maxPlacesPhotos: 20,
-        // Было 6/2: быстрый взгляд — это то, что видит жюри по умолчанию, и с этими
-        // потолками он показывал 1-2 фотографии на категорию даже когда кандидатов
-        // хватало на больше. maxDuration у /api/profile — 180 с, а быстрый обычно
-        // укладывается в 10-15 — запас есть, несколько лишних снимков его не тронут.
-        maxOfficialPhotos: 12,
-        maxPerCategory: 2,
-        maxCityPhotos: 1,
-        maxCitywidePhotos: 1,
+        photosPerPlace: 4,
+        maxPlacesPhotos: Number.POSITIVE_INFINITY,
+        maxOfficialPhotos: Number.POSITIVE_INFINITY,
+        maxPerCategory: Number.POSITIVE_INFINITY,
+        maxCityPhotos: Number.POSITIVE_INFINITY,
+        maxCitywidePhotos: Number.POSITIVE_INFINITY,
       }
     : {
         photosPerPlace: PHOTOS_PER_PLACE,
-        maxPlacesPhotos: MAX_PLACES_PHOTOS,
-        maxOfficialPhotos: MAX_OFFICIAL_PHOTOS,
-        maxPerCategory: MAX_PER_CATEGORY,
-        maxCityPhotos: MAX_CITY_PHOTOS,
-        maxCitywidePhotos: MAX_CITYWIDE_PHOTOS,
+        maxPlacesPhotos: Number.POSITIVE_INFINITY,
+        maxOfficialPhotos: Number.POSITIVE_INFINITY,
+        maxPerCategory: Number.POSITIVE_INFINITY,
+        maxCityPhotos: Number.POSITIVE_INFINITY,
+        maxCitywidePhotos: Number.POSITIVE_INFINITY,
       };
 }
 
@@ -551,11 +549,28 @@ export async function buildProfile(
   onProgress: (e: ProgressEvent) => void = () => {},
   mode: ProfileMode = "deep",
   quickBudgetMs = QUICK_TOTAL_BUDGET_MS,
+  seedProfile?: Profile,
 ): Promise<Profile> {
   const started = Date.now();
-  const quickDeadline = mode === "quick" ? started + Math.min(QUICK_TOTAL_BUDGET_MS, quickBudgetMs) : Infinity;
-  const timeLeft = () => Math.max(0, quickDeadline - Date.now());
+  const totalBudgetMs = mode === "quick" ? Math.min(QUICK_TOTAL_BUDGET_MS, quickBudgetMs) : DEEP_TOTAL_BUDGET_MS;
+  const deadline = started + totalBudgetMs;
+  const timeLeft = () => Math.max(0, deadline - Date.now());
+  const deadlineController = new AbortController();
+  const deadlineTimer = setTimeout(() => deadlineController.abort(), totalBudgetMs);
+  const deadlineSignal = deadlineController.signal;
   const limits = limitsFor(mode);
+  const session = profileSession(university.qid, mode === "quick" || !seedProfile);
+  const seedPhotos = mode === "deep" && seedProfile?.university.qid === university.qid
+    ? seedProfile.photos
+    : [];
+  const seedIds = new Set(seedPhotos.map((photo) => photo.id));
+  const seedUrls = new Set(seedPhotos.map((photo) => photo.imageUrl));
+  const seedHashes = seedPhotos.map((photo) => photo.hash).filter((hash): hash is string => Boolean(hash));
+  const markProcessed = (raw: RawPhoto) => {
+    session.processedIds.add(raw.id);
+    session.processedUrls.add(raw.imageUrl);
+    session.touchedAt = Date.now();
+  };
   const plan = QUERY_PLAN.filter((item) => mode === "deep" || item.quick);
   const warnings: string[] = [];
   if (university.resolvedVia === "places") {
@@ -595,10 +610,14 @@ export async function buildProfile(
 
   // Обход сайта не зависит от координат и запросов Places. Запускаем его сразу,
   // пока остальные источники определяют кампус и соседние места.
+  const officialController = new AbortController();
+  const officialSignal = AbortSignal.any([deadlineSignal, officialController.signal]);
   const officialPromise: Promise<OfficialResult> = university.officialWebsite
     ? collectOfficialImages(university.officialWebsite, USER_AGENT, {
         deep: mode === "deep",
-        maxCandidates: mode === "deep" ? undefined : limits.maxOfficialPhotos * 2,
+        maxCandidates: mode === "deep" ? 500 : 96,
+        budgetMs: mode === "deep" ? Math.min(70_000, timeLeft() - 25_000) : Math.min(16_000, timeLeft() - 10_000),
+        signal: officialSignal,
       }).catch((e) => ({
         candidates: [], pagesVisited: [], blockedByRobots: [], robotsNote: null,
         skippedForTime: 0, error: `сайт недоступен: ${(e as Error).message}`,
@@ -608,10 +627,10 @@ export async function buildProfile(
         skippedForTime: 0, error: "официальный сайт вуза неизвестен",
       });
   const selectedOfficialPromise = mode === "quick"
-    ? withDeadline(officialPromise, QUICK_OFFICIAL_BUDGET_MS, {
+    ? withDeadline(officialPromise, Math.max(0, timeLeft() - 10_000), {
         candidates: [], pagesVisited: [], blockedByRobots: [], robotsNote: null, skippedForTime: 0,
         error: "сайт не ответил за время быстрого взгляда; полный сбор продолжит его проверку",
-      })
+      }, () => officialController.abort())
     : officialPromise;
   // Commons — дополнительный источник с более слабой географической привязкой.
   // Его несколько последовательных API-запросов не должны задерживать быстрый взгляд.
@@ -625,8 +644,8 @@ export async function buildProfile(
   try {
     campusPlaces = campusQuery
       ? await (mode === "quick"
-          ? withDeadline(searchText(campusQuery, { bias: wikidataBias, pageSize: Math.max(3, campusPlan.pageSize) }), 6500, [])
-          : searchText(campusQuery, { bias: wikidataBias, pageSize: Math.max(3, campusPlan.pageSize) }))
+          ? withDeadline(searchText(campusQuery, { bias: wikidataBias, pageSize: Math.max(5, campusPlan.pageSize), signal: deadlineSignal }), Math.min(8000, timeLeft()), [])
+          : searchTextPages(campusQuery, { bias: wikidataBias, pageSize: Math.max(5, campusPlan.pageSize), maxPages: 2, signal: deadlineSignal }))
       : [];
   } catch (e) {
     warnings.push(`Places: основной запрос не выполнен (${(e as Error).message})`);
@@ -708,12 +727,12 @@ export async function buildProfile(
         const q = item.build(university);
         if (!q) return { category: item.category, places: [] as Place[] };
         const itemBias = bias && item.biasRadiusM ? { ...bias, radiusM: item.biasRadiusM } : bias;
-        // В быстром взгляде берём по одному месту на запрос: доске хватает, а время
-        // уходит не на поиск, а на загрузку и проверку снимков.
-        const pageSize = mode === "quick" ? 1 : item.pageSize;
+        const pageSize = mode === "quick" ? Math.max(3, item.pageSize) : Math.max(5, item.pageSize);
         try {
-          const request = searchText(q, { bias: itemBias, pageSize });
-          return { category: item.category, places: mode === "quick" ? await withDeadline(request, Math.min(6500, timeLeft()), []) : await request };
+          const request = mode === "quick"
+            ? searchText(q, { bias: itemBias, pageSize, signal: deadlineSignal })
+            : searchTextPages(q, { bias: itemBias, pageSize, maxPages: 2, signal: deadlineSignal });
+          return { category: item.category, places: mode === "quick" ? await withDeadline(request, Math.min(8000, timeLeft()), []) : await request };
         } catch (e) {
           warnings.push(`Places: запрос «${q}» не выполнен (${(e as Error).message})`);
           return { category: item.category, places: [] as Place[] };
@@ -728,6 +747,11 @@ export async function buildProfile(
     seenPlaces.add(campusPlace.id);
     jobs.push({ place: campusPlace, category: "campus" });
   }
+  for (const place of campusPlaces) {
+    if (seenPlaces.has(place.id)) continue;
+    seenPlaces.add(place.id);
+    jobs.push({ place, category: "campus" });
+  }
   for (const r of restResults) {
     for (const place of r.places) {
       if (seenPlaces.has(place.id)) continue;
@@ -739,13 +763,18 @@ export async function buildProfile(
   // Бюджет снимков делим между местами по кругу, а не обрезаем хвост плана: иначе три
   // фотографии главного корпуса вытесняют единственный снимок общежития или столовой,
   // и категория остаётся пустой не потому, что снимков не нашлось.
-  const perPlace = await Promise.all(
-    jobs.map((j) =>
-      mode === "quick"
-        ? withDeadline(placeToRaw(j.place, j.category, anchor, anchorPlaceId, university.city, campusCity, university.label, university.officialWebsite, limits.photosPerPlace), Math.min(5000, timeLeft()), [])
-        : placeToRaw(j.place, j.category, anchor, anchorPlaceId, university.city, campusCity, university.label, university.officialWebsite, limits.photosPerPlace),
-    ),
-  );
+  const perPlace = (await mapWithLimit(
+    jobs,
+    5,
+    (j) => mode === "quick"
+      ? withDeadline(
+          placeToRaw(j.place, j.category, anchor, anchorPlaceId, university.city, campusCity, university.label, university.officialWebsite, limits.photosPerPlace, deadlineSignal),
+          Math.min(7000, timeLeft()),
+          [],
+        )
+      : placeToRaw(j.place, j.category, anchor, anchorPlaceId, university.city, campusCity, university.label, university.officialWebsite, limits.photosPerPlace, deadlineSignal),
+    deadlineSignal,
+  )).filter((group): group is RawPhoto[] => Array.isArray(group));
   const placesRaw = interleave(perPlace, limits.maxPlacesPhotos);
   onProgress({ stage: "places", found: placesRaw.length });
 
@@ -844,24 +873,47 @@ export async function buildProfile(
   }));
 
   // 4. Загрузка всех картинок. Официальные — с проверкой размера (на сайтах много иконок).
-  const allRaw = [...officialRaw, ...placesRaw, ...commonsRaw];
+  const discoveredRaw = [...officialRaw, ...placesRaw, ...commonsRaw];
+  const allRaw = discoveredRaw.filter((raw) =>
+    !seedIds.has(raw.id) &&
+    !seedUrls.has(raw.imageUrl) &&
+    !session.processedIds.has(raw.id) &&
+    !session.processedUrls.has(raw.imageUrl));
+  const collectionStats = {
+    discovered: discoveredRaw.length + seedPhotos.length,
+    downloaded: seedPhotos.length,
+    checked: seedPhotos.filter((photo) => photo.evidence.vision).length,
+    accepted: seedPhotos.length,
+  };
   onProgress({ stage: "download", total: allRaw.length });
+  onProgress({ stage: "stats", ...collectionStats, remainingMs: timeLeft() });
 
   const completedDownloads: Loaded[] = [];
+  const attemptedDownloadIds = new Set<string>();
+  let lastDownloadStatsAt = 0;
+  const downloadWindowMs = mode === "quick"
+    ? Math.max(0, timeLeft() - 6_000)
+    : Math.max(0, timeLeft() - 30_000);
+  const downloadController = new AbortController();
+  const downloadTimer = setTimeout(() => downloadController.abort(), downloadWindowMs);
+  const downloadSignal = AbortSignal.any([deadlineSignal, downloadController.signal]);
   const downloadWork = mapWithLimit(allRaw, DOWNLOAD_CONCURRENCY, async (raw): Promise<Loaded | null> => {
-      const img = await loadImage(raw.imageUrl, USER_AGENT);
+      attemptedDownloadIds.add(raw.id);
+      const img = await loadImage(raw.imageUrl, USER_AGENT, downloadSignal);
       if (!img) {
-        removed.failedDownload++;
+        if (!downloadSignal.aborted) removed.failedDownload++;
         return null;
       }
       if (raw.source === "official_site" && (img.width < MIN_WIDTH_PX || img.height < MIN_HEIGHT_PX)) {
         removed.tooSmall++;
+        markProcessed(raw);
         return null;
       }
       // Резкость меряем до всего остального: размытый кадр не станет полезнее ни от
       // проверки расстояния, ни от вердикта модели, а место в профиле займёт.
       if ((await sharpness(img.bytes)) < SHARPNESS_MIN) {
         removed.blurry++;
+        markProcessed(raw);
         return null;
       }
       const hash = await dHash(img.bytes);
@@ -871,10 +923,16 @@ export async function buildProfile(
       }
       const result = { raw, img, hash };
       completedDownloads.push(result);
+      collectionStats.downloaded = seedPhotos.length + completedDownloads.length;
+      const now = Date.now();
+      if (collectionStats.downloaded % 5 === 0 || now - lastDownloadStatsAt >= 300) {
+        lastDownloadStatsAt = now;
+        onProgress({ stage: "stats", ...collectionStats, remainingMs: timeLeft() });
+      }
       return result;
-  });
-  if (mode === "quick") await withDeadline(downloadWork, Math.max(0, timeLeft() - 9000), []);
-  else await downloadWork;
+  }, downloadSignal);
+  await downloadWork;
+  clearTimeout(downloadTimer);
   let loaded = completedDownloads.slice();
   // Массовый отказ загрузок — это не «фотографий нет», а «источник перестал отвечать».
   // Разные вещи, и путать их в профиле нельзя.
@@ -915,9 +973,15 @@ export async function buildProfile(
   );
   const kept: Loaded[] = [];
   for (const cand of loaded) {
+    if (seedHashes.some((hash) => hamming(hash, cand.hash) <= DUPLICATE_HAMMING)) {
+      removed.duplicates++;
+      markProcessed(cand.raw);
+      continue;
+    }
     const dup = kept.find((k) => hamming(k.hash, cand.hash) <= DUPLICATE_HAMMING);
     if (dup) {
       removed.duplicates++;
+      markProcessed(cand.raw);
       continue;
     }
     kept.push(cand);
@@ -932,28 +996,28 @@ export async function buildProfile(
   if (process.env.GEMINI_API_KEY) {
     const context = { universityName: university.label, city: university.city };
     if (mode === "quick") {
-      // One candidate per still-empty category per round. A vision verdict may move a
-      // photo to another category; only actual verdicts count toward coverage.
       const attempted = new Set<string>();
-      const covered = new Set<Category>();
       const queues = new Map<Category, Loaded[]>(QUICK_CATEGORIES.map((c) => [c, kept.filter((k) => k.raw.category === c)]));
       const officialWildcards = kept.filter((k) => k.raw.source === "official_site");
-      const streamedByCategory = new Map<Category, number>();
-      for (let round = 0; round < 3 && timeLeft() > 2500; round++) {
+      const acceptedByCategory = new Map<Category, number>(QUICK_CATEGORIES.map((category) => [
+        category,
+        seedPhotos.filter((photo) => photo.category === category).length,
+      ]));
+      while (timeLeft() > 800 && !deadlineSignal.aborted) {
         const selection: Loaded[] = [];
-        for (const category of QUICK_CATEGORIES) {
-          if (covered.has(category)) continue;
+        const categoryOrder = [...QUICK_CATEGORIES].sort(
+          (a, b) => (acceptedByCategory.get(a) ?? 0) - (acceptedByCategory.get(b) ?? 0),
+        );
+        for (const category of categoryOrder) {
           const candidate = queues.get(category)?.find((k) => !attempted.has(k.raw.id));
           if (candidate) selection.push(candidate);
         }
         // Official pages have no reliable category metadata. Inspect several as
         // wildcards in the same parallel AI call: otherwise a site may expose many
         // useful photos while Quick Board checks only one banner per round.
-        if (covered.size < QUICK_CATEGORIES.length) {
-          for (const extra of officialWildcards) {
-            if (selection.length >= 8) break;
-            if (!attempted.has(extra.raw.id) && !selection.includes(extra)) selection.push(extra);
-          }
+        for (const extra of officialWildcards) {
+          if (selection.length >= 8) break;
+          if (!attempted.has(extra.raw.id) && !selection.includes(extra)) selection.push(extra);
         }
         if (!selection.length) break;
         selection.forEach((k) => attempted.add(k.raw.id));
@@ -972,15 +1036,12 @@ export async function buildProfile(
           const category = categoryFromEvidence(raw, v);
           if (category === "other" || !QUICK_CATEGORIES.includes(category)) return;
           const trust = v.confidence === "low" ? downgrade(raw.trust) : raw.trust;
-          if (trust !== "unverified") covered.add(category);
+          if (trust !== "unverified") acceptedByCategory.set(category, (acceptedByCategory.get(category) ?? 0) + 1);
           const reasons = [...raw.evidence.reasons,
             `Содержимое проверено (Gemini, уверенность ${v.confidence}): ${v.caption}`,
             ...(category !== v.category ? [`На фото виден фасад; тип здания подтверждён названием места «${raw.evidence.placeName}»`] : []),
             ...(category !== raw.category ? [`Категория по содержимому: «${category}» (по запросу было «${raw.category}»)`] : []),
           ];
-          const alreadyStreamed = streamedByCategory.get(category) ?? 0;
-          if (alreadyStreamed >= limits.maxPerCategory) return;
-          streamedByCategory.set(category, alreadyStreamed + 1);
           onProgress({ stage: "photo", photo: {
             id: raw.id, source: raw.source, imageUrl: raw.imageUrl,
             sourceUrl: raw.sourceUrl, attribution: raw.attribution, license: raw.license,
@@ -993,11 +1054,145 @@ export async function buildProfile(
           } });
         });
         visionErrors.push(...result.errors);
+        collectionStats.checked = seedPhotos.filter((photo) => photo.evidence.vision).length + verdicts.size;
+        collectionStats.accepted = seedPhotos.length + [...verdicts.values()].filter((verdict) => verdict.relevant && verdict.category !== "other").length;
+        onProgress({ stage: "stats", ...collectionStats, remainingMs: timeLeft() });
+      }
+
+      // If the first download window filled up, spend the remaining budget on small
+      // end-to-end batches instead of finishing early with candidates still queued.
+      const downloadedIds = new Set(completedDownloads.map((item) => item.raw.id));
+      const pendingRaw = allRaw.filter((raw) => !downloadedIds.has(raw.id));
+      while (pendingRaw.length > 0 && timeLeft() > 1_000 && !deadlineSignal.aborted) {
+        pendingRaw.sort(
+          (a, b) =>
+            (acceptedByCategory.get(a.category) ?? 0) - (acceptedByCategory.get(b.category) ?? 0) ||
+            SOURCE_RANK[a.source] - SOURCE_RANK[b.source],
+        );
+        const rawBatch = pendingRaw.splice(0, BATCH_SIZE);
+        const extraLoaded: Loaded[] = [];
+        await mapWithLimit(rawBatch, BATCH_SIZE, async (raw) => {
+          attemptedDownloadIds.add(raw.id);
+          const img = await loadImage(raw.imageUrl, USER_AGENT, deadlineSignal);
+          if (!img) {
+            if (!deadlineSignal.aborted) removed.failedDownload++;
+            return;
+          }
+          if (raw.source === "official_site" && (img.width < MIN_WIDTH_PX || img.height < MIN_HEIGHT_PX)) {
+            removed.tooSmall++;
+            markProcessed(raw);
+            return;
+          }
+          if ((await sharpness(img.bytes)) < SHARPNESS_MIN) {
+            removed.blurry++;
+            markProcessed(raw);
+            return;
+          }
+          const hash = await dHash(img.bytes);
+          if (seedHashes.some((seedHash) => hamming(seedHash, hash) <= DUPLICATE_HAMMING) ||
+              kept.some((item) => hamming(item.hash, hash) <= DUPLICATE_HAMMING)) {
+            removed.duplicates++;
+            markProcessed(raw);
+            return;
+          }
+          if (raw.source === "official_site") {
+            raw.widthPx = img.width;
+            raw.heightPx = img.height;
+          }
+          const loadedItem = { raw, img, hash };
+          kept.push(loadedItem);
+          completedDownloads.push(loadedItem);
+          extraLoaded.push(loadedItem);
+        }, deadlineSignal);
+        collectionStats.downloaded = seedPhotos.length + completedDownloads.length;
+        if (extraLoaded.length === 0) continue;
+        const extraResult = await classifyImages(
+          extraLoaded.map((item) => ({ id: item.raw.id, bytes: item.img.bytes, mime: item.img.mime })),
+          context,
+          { concurrency: 1, retry: false, signal: deadlineSignal },
+        );
+        extraResult.verdicts.forEach((verdict, id) => {
+          verdicts.set(id, verdict);
+          if (!verdict.relevant || verdict.category === "other") return;
+          const item = extraLoaded.find((candidate) => candidate.raw.id === id);
+          if (!item) return;
+          const category = categoryFromEvidence(item.raw, verdict);
+          if (category !== "other" && QUICK_CATEGORIES.includes(category)) {
+            acceptedByCategory.set(category, (acceptedByCategory.get(category) ?? 0) + 1);
+          }
+        });
+        visionErrors.push(...extraResult.errors);
+        collectionStats.checked = seedPhotos.filter((photo) => photo.evidence.vision).length + verdicts.size;
+        collectionStats.accepted = seedPhotos.length + [...verdicts.values()].filter((verdict) => verdict.relevant && verdict.category !== "other").length;
+        onProgress({ stage: "stats", ...collectionStats, remainingMs: timeLeft() });
       }
     } else {
-      const r = await classifyImages(visionInputs, context);
+      const streamDeepVerdict = (item: Loaded, verdict: VisionVerdict): PhotoItem | null => {
+        const raw = item.raw;
+        if (!verdict.relevant || verdict.category === "other") return null;
+        let category = raw.category;
+        let trust = raw.trust;
+        const reasons = [...raw.evidence.reasons];
+        const evidenceCategory = categoryFromEvidence(raw, verdict);
+        if (raw.category === "citywide" && verdict.category === "city") {
+          reasons.push("Содержимое подтверждено как городская сцена; отнесено к городу, а не к окружению кампуса, по запросу и расстоянию");
+        } else if (evidenceCategory !== raw.category) {
+          reasons.push(`Категория по содержимому: «${evidenceCategory}» (по запросу было «${raw.category}»)`);
+          category = evidenceCategory as Category;
+        } else if (evidenceCategory === verdict.category) {
+          reasons.push(`Категория по содержимому совпала с запросом: «${category}»`);
+        }
+        if (evidenceCategory !== verdict.category) reasons.push(`На фото виден фасад; тип здания подтверждён названием места «${raw.evidence.placeName}»`);
+        reasons.push(`Содержимое проверено (Gemini, уверенность ${verdict.confidence}): ${verdict.caption}`);
+        if (verdict.confidence === "low") {
+          reasons.push("Низкая уверенность модели в содержимом — доверие понижено на один уровень");
+          trust = downgrade(trust);
+        }
+        if (raw.source === "wikimedia_commons" && (category === "city" || category === "citywide")) return null;
+        if (category === "citywide" && !verdict.wideView) return null;
+        if (category === "citywide") reasons.push("Кадр определён как общий вид: панорама, перспектива улицы или силуэт города");
+        if (category === "city" && raw.evidence.distanceM !== null && raw.evidence.distanceM > NEIGHBORHOOD_MAX_M) return null;
+        return {
+          id: raw.id,
+          source: raw.source,
+          imageUrl: raw.imageUrl,
+          sourceUrl: raw.sourceUrl,
+          attribution: raw.attribution,
+          license: raw.license,
+          publishedAt: raw.publishedAt,
+          retrievedAt: new Date().toISOString(),
+          category,
+          trust,
+          evidence: { ...raw.evidence, vision: verdict, reasons },
+          widthPx: raw.widthPx || item.img.width,
+          heightPx: raw.heightPx || item.img.height,
+          hash: item.hash,
+        };
+      };
+      const keptById = new Map(kept.map((item) => [item.raw.id, item]));
+      const streamedDeepIds = new Set<string>();
+      const streamedCheckedIds = new Set<string>();
+      const r = await classifyImages(visionInputs, context, {
+        signal: deadlineSignal,
+        onBatch: (partial) => {
+          partial.forEach((verdict, id) => {
+            streamedCheckedIds.add(id);
+            const item = keptById.get(id);
+            if (!item) return;
+            const photo = streamDeepVerdict(item, verdict);
+            if (!photo || streamedDeepIds.has(photo.id)) return;
+            streamedDeepIds.add(photo.id);
+            onProgress({ stage: "photo", photo });
+          });
+          collectionStats.checked = seedPhotos.filter((photo) => photo.evidence.vision).length + streamedCheckedIds.size;
+          collectionStats.accepted = seedPhotos.length + streamedDeepIds.size;
+          onProgress({ stage: "stats", ...collectionStats, remainingMs: timeLeft() });
+        },
+      });
       verdicts = r.verdicts;
       visionErrors = r.errors;
+      collectionStats.checked = seedPhotos.filter((photo) => photo.evidence.vision).length + verdicts.size;
+      onProgress({ stage: "stats", ...collectionStats, remainingMs: timeLeft() });
     }
   } else {
     warnings.push("Ключ GEMINI_API_KEY не задан — содержимое снимков не проверялось, доверие ограничено уровнем «вероятно»");
@@ -1008,7 +1203,7 @@ export async function buildProfile(
   const visionAvailable = verdicts.size > 0;
 
   // 7. Применяем вердикты: отсев нерелевантных, категория по содержимому.
-  const photos: PhotoItem[] = [];
+  const photos: PhotoItem[] = [...seedPhotos];
   for (const k of kept) {
     const raw = k.raw;
     const v = verdicts.get(raw.id) ?? null;
@@ -1018,6 +1213,7 @@ export async function buildProfile(
     // «на нём кампус». Без проверки содержимого такой снимок не показываем.
     if (raw.source === "wikimedia_commons" && !v) {
       removed.irrelevant++;
+      markProcessed(raw);
       continue;
     }
     let category = raw.category;
@@ -1027,6 +1223,7 @@ export async function buildProfile(
     if (v) {
       if (!v.relevant || v.category === "other") {
         removed.irrelevant++;
+        markProcessed(raw);
         continue;
       }
       const evidenceCategory = categoryFromEvidence(raw, v);
@@ -1058,6 +1255,7 @@ export async function buildProfile(
     // категории не может автоматически стать «вокруг кампуса».
     if (raw.source === "wikimedia_commons" && (category === "city" || category === "citywide")) {
       removed.irrelevant++;
+      markProcessed(raw);
       continue;
     }
 
@@ -1067,6 +1265,7 @@ export async function buildProfile(
     if (category === "citywide") {
       if (v && !v.wideView) {
         removed.cityNotWide++;
+        markProcessed(raw);
         continue;
       }
       if (v) reasons.push("Кадр определён как общий вид: панорама, перспектива улицы или силуэт города");
@@ -1079,10 +1278,11 @@ export async function buildProfile(
     // расстояния (с сайта вуза) под проверку не подпадают: их провенанс — домен.
     if (category === "city" && raw.evidence.distanceM !== null && raw.evidence.distanceM > NEIGHBORHOOD_MAX_M) {
       removed.farFromCampus++;
+      markProcessed(raw);
       continue;
     }
 
-    photos.push({
+    const photo: PhotoItem = {
       id: raw.id,
       source: raw.source,
       imageUrl: raw.imageUrl,
@@ -1097,7 +1297,9 @@ export async function buildProfile(
       widthPx: raw.widthPx || k.img.width,
       heightPx: raw.heightPx || k.img.height,
       hash: k.hash,
-    });
+    };
+    photos.push(photo);
+    markProcessed(raw);
   }
 
   // 8. Окружение ограничиваем и ставим в конец: это контекст, а не объекты вуза.
@@ -1199,7 +1401,17 @@ export async function buildProfile(
   const coverage = computeCoverage(photos);
   const description = describeCampus(university, anchor, photos, coverage, cityCenter);
   if (photos.length === 0) warnings.push("Ни одной фотографии не прошло проверку — профиль пуст");
+  collectionStats.checked = seedPhotos.filter((photo) => photo.evidence.vision).length + verdicts.size;
+  collectionStats.accepted = photos.length;
+  const hasPendingCandidates =
+    allRaw.some((raw) => !attemptedDownloadIds.has(raw.id)) ||
+    (Boolean(process.env.GEMINI_API_KEY) && kept.some((item) => !verdicts.has(item.raw.id)));
+  const stopReason = deadlineSignal.aborted || (hasPendingCandidates && timeLeft() < 1_500)
+    ? "deadline_reached" as const
+    : "sources_exhausted" as const;
+  onProgress({ stage: "stats", ...collectionStats, remainingMs: timeLeft(), stopReason });
   onProgress({ stage: "done" });
+  clearTimeout(deadlineTimer);
 
   return {
     mode,
@@ -1222,5 +1434,7 @@ export async function buildProfile(
     visionAvailable,
     warnings,
     timingMs: Date.now() - started,
+    collectionStats,
+    stopReason,
   };
 }

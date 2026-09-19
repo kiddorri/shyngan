@@ -163,6 +163,12 @@
   margin-bottom: 10px;
 }
 
+.progressMetrics {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .progressList {
   list-style: none;
   display: grid;

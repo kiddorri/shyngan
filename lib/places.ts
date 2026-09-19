@@ -26,7 +26,7 @@ const PLACE_FIELDS = [
 
 // Field mask обязателен: без него API возвращает ошибку.
 // В ответе searchText места лежат в массиве places, поэтому здесь поля с префиксом.
-const TEXT_SEARCH_FIELD_MASK = PLACE_FIELDS.map((f) => `places.${f}`).join(",");
+const TEXT_SEARCH_FIELD_MASK = [...PLACE_FIELDS.map((f) => `places.${f}`), "nextPageToken"].join(",");
 // Place Details отдаёт объект Place на верхнем уровне — здесь поля без префикса.
 const PLACE_DETAILS_FIELD_MASK = PLACE_FIELDS.join(",");
 
@@ -75,13 +75,22 @@ export type LocationBias = {
 
 export async function searchText(
   textQuery: string,
-  opts: { bias?: LocationBias; pageSize?: number; languageCode?: string } = {},
+  opts: { bias?: LocationBias; pageSize?: number; languageCode?: string; signal?: AbortSignal } = {},
 ): Promise<Place[]> {
+  return (await searchTextPage(textQuery, opts)).places;
+}
+
+export async function searchTextPage(
+  textQuery: string,
+  opts: { bias?: LocationBias; pageSize?: number; languageCode?: string; pageToken?: string; signal?: AbortSignal } = {},
+): Promise<{ places: Place[]; nextPageToken: string | null }> {
   const body: Record<string, unknown> = {
     textQuery,
     languageCode: opts.languageCode ?? "ru",
     pageSize: Math.min(Math.max(opts.pageSize ?? 3, 1), 20),
   };
+
+  if (opts.pageToken) body.pageToken = opts.pageToken;
 
   if (opts.bias) {
     body.locationBias = {
@@ -100,7 +109,9 @@ export async function searchText(
       "X-Goog-FieldMask": TEXT_SEARCH_FIELD_MASK,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: opts.signal
+      ? AbortSignal.any([opts.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)])
+      : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -108,8 +119,25 @@ export async function searchText(
     throw new Error(`Places searchText HTTP ${res.status}: ${text.slice(0, 300)}`);
   }
 
-  const json = (await res.json()) as { places?: Place[] };
-  return json.places ?? [];
+  const json = (await res.json()) as { places?: Place[]; nextPageToken?: string };
+  return { places: json.places ?? [], nextPageToken: json.nextPageToken ?? null };
+}
+
+/** Reads subsequent Text Search pages without changing the query parameters. */
+export async function searchTextPages(
+  textQuery: string,
+  opts: { bias?: LocationBias; pageSize?: number; languageCode?: string; maxPages?: number; signal?: AbortSignal } = {},
+): Promise<Place[]> {
+  const out: Place[] = [];
+  let pageToken: string | undefined;
+  const pages = Math.max(1, opts.maxPages ?? 1);
+  for (let page = 0; page < pages && !opts.signal?.aborted; page++) {
+    const result = await searchTextPage(textQuery, { ...opts, pageToken });
+    out.push(...result.places);
+    if (!result.nextPageToken) break;
+    pageToken = result.nextPageToken;
+  }
+  return out;
 }
 
 /**
@@ -213,13 +241,18 @@ export async function getPlaceReviews(placeId: string, limit = 5): Promise<Place
 export async function getPhotoUri(
   photoName: string,
   maxWidthPx = 800,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   const url =
     `${PLACES_BASE}/${photoName}/media` +
     `?maxWidthPx=${maxWidthPx}&skipHttpRedirect=true&key=${encodeURIComponent(apiKey())}`;
 
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    const res = await fetch(url, {
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)])
+        : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
     if (!res.ok) return null;
     const json = (await res.json()) as { photoUri?: string };
     return json.photoUri ?? null;

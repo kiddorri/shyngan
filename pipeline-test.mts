@@ -469,8 +469,9 @@ console.log("распределение бюджета ok");
 
 // ---- 5. полный профиль ----
 const events: any[] = [];
+const testUniversity = { qid: "Q1", resolvedVia: "sparql" as const, label: "Тестовый Университет", lat: null, lon: null, officialWebsite: "https://example.edu", country: "Казахстан", city: "Астана", image: null, instanceOf: "университет" };
 const profile = await buildProfile(
-  { qid: "Q1", resolvedVia: "sparql" as const, label: "Тестовый Университет", lat: null, lon: null, officialWebsite: "https://example.edu", country: "Казахстан", city: "Астана", image: null, instanceOf: "университет" },
+  testUniversity,
   (e) => events.push(e),
 );
 
@@ -498,21 +499,19 @@ assert.equal(profile.removed.duplicates, 1); // a2 — пережатая коп
 // Расфокусированный кадр отсеян по резкости, а не по «похоже на мусор».
 assert.equal(profile.removed.blurry, 1, "размытый снимок должен отсеиваться");
 assert.equal(profile.photos.some((p) => p.imageUrl.endsWith("/img/blurry.jpg")), false);
-// С одного места берём не больше двух снимков, из окружения — один.
+// Places API может отдать до десяти снимков карточки; искусственного лимита в два больше нет.
 for (const placeId of ["P_CAMPUS", "P_DORM", "P_LECTURE", "P_PARK_FAR"]) {
   const n = profile.photos.filter((p) => p.evidence.placeId === placeId).length;
-  assert.ok(n <= 2, `с места ${placeId} взято ${n} снимков`);
+  assert.ok(n <= 10, `с места ${placeId} взято больше API-предела: ${n}`);
 }
 // Снимки из целевых разделов сайта дошли до профиля.
 for (const url of ["/img/lib.jpg", "/img/canteen.jpg"]) {
   assert.ok(profile.photos.some((p) => p.imageUrl.endsWith(url)), `снимок из целевого раздела потерян: ${url}`);
 }
-// Потолок на категорию: в «кампусе» кандидатов больше шести, лишние посчитаны.
-for (const c of profile.coverage) {
-  const total = c.verified + c.probable + c.unverified;
-  assert.ok(total <= (c.category === "city" ? 3 : 6), `категория ${c.category}: ${total} снимков сверх потолка`);
-}
-assert.ok(profile.removed.overCategoryLimit >= 1, "лишние снимки категории должны быть посчитаны");
+// Deep Dive больше не обрезает полезную категорию на шестом кадре.
+const deepCampus = profile.coverage.find((c) => c.category === "campus")!;
+assert.ok(deepCampus.verified + deepCampus.probable + deepCampus.unverified > 6, "Deep Dive должен сохранить глубокую кампусную подборку");
+assert.equal(profile.removed.overCategoryLimit, 0, "искусственного потолка категории больше нет");
 const queries: string[] = captured.places.map((b) => b.textQuery);
 for (const part of ["учебный корпус", "актовый зал", "столовая"]) {
   assert.ok(queries.some((q: string) => q.includes(part)), `в плане поиска нет запроса «${part}»: ${queries.join(" | ")}`);
@@ -679,7 +678,8 @@ assert.equal(typeof cachedLines[1].cacheAgeMs, "number");
 console.log("profile cache ok");
 
 // Без параметра режим — быстрый взгляд: он дешевле, и профиль обязан это сообщать.
-const quickRes = await GET(new Request("http://localhost/api/profile?qid=Q1"));
+// Старый startedAt намеренно очень давний: время резолва больше не отнимается от Quick Look.
+const quickRes = await GET(new Request("http://localhost/api/profile?qid=Q1&startedAt=1"));
 const quickLines = quickRes.headers.get("content-type")?.startsWith("application/x-ndjson")
   ? (await quickRes.text()).trim().split("\n").map((line) => JSON.parse(line))
   : [];
@@ -695,15 +695,21 @@ assert.ok(
   quickProfile.photos.length < profile.photos.length,
   `быстрый взгляд должен быть короче полного: ${quickProfile.photos.length} против ${profile.photos.length}`,
 );
-// Небольшой потолок на категорию: это доска, а не галерея.
-for (const c of quickProfile.coverage) {
-  const total = c.verified + c.probable + c.unverified;
-  assert.ok(total <= 2, `в быстром взгляде категория ${c.category}: ${total} снимков`);
-}
-// И он не должен уходить вглубь сайта: одна страница сверх главной.
+assert.equal(typeof quickProfile.collectionStats.discovered, "number");
+assert.equal(quickProfile.collectionStats.accepted, quickProfile.photos.length);
+assert.ok(["sources_exhausted", "deadline_reached"].includes(quickProfile.stopReason));
+// Quick Look использует бюджет на несколько релевантных разделов, но остаётся ограничен временем.
 const quickPages = quickProfile.warnings.find((w: string) => w.includes("прочитано страниц"));
-assert.ok(!quickPages || /страниц — [1-4] /.test(quickPages), `быстрый взгляд читает слишком много: ${quickPages}`);
+assert.ok(!quickPages || /страниц — [1-9] /.test(quickPages), `быстрый взгляд вышел за свой бюджет страниц: ${quickPages}`);
 console.log("быстрый взгляд ok:", quickProfile.photos.length, "фото против", profile.photos.length);
+
+// Deep Dive продолжает Quick Look: уже принятые карточки входят в расширенный профиль.
+const resumed = await buildProfile(testUniversity, () => {}, "deep", 30_000, quickProfile);
+for (const photo of quickProfile.photos) {
+  assert.ok(resumed.photos.some((candidate) => candidate.id === photo.id), `Deep Dive потерял Quick-фото ${photo.id}`);
+}
+assert.ok(resumed.photos.length >= quickProfile.photos.length);
+console.log("продолжение Quick → Deep ok:", quickProfile.photos.length, "→", resumed.photos.length);
 
 const bad = await GET(new Request("http://localhost/api/profile?qid=abc"));
 assert.equal(bad.status, 400);

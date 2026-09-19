@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:search": "node search-smoke.mjs",
-    "test:pipeline": "tsx pipeline-test.mts",
+    "test:pipeline": "node --import ./scripts/tsx-register.mjs --import tsx pipeline-test.mts",
     "benchmark:profile": "node profile-benchmark.mjs"
   },
   "dependencies": {

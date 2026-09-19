@@ -151,7 +151,12 @@ async function classifyBatch(batch: VisionInput[], ctx: VisionContext, signal?: 
 export async function classifyImages(
   inputs: VisionInput[],
   ctx: VisionContext,
-  options: { concurrency?: number; retry?: boolean; signal?: AbortSignal } = {},
+  options: {
+    concurrency?: number;
+    retry?: boolean;
+    signal?: AbortSignal;
+    onBatch?: (verdicts: Map<string, VisionVerdict>) => void;
+  } = {},
 ): Promise<{ verdicts: Map<string, VisionVerdict>; errors: string[] }> {
   const verdicts = new Map<string, VisionVerdict>();
   const errors: string[] = [];
@@ -173,6 +178,7 @@ export async function classifyImages(
         try {
           const partial = await classifyBatch(batch, ctx, options.signal);
           partial.forEach((v, k) => verdicts.set(k, v));
+          options.onBatch?.(partial);
           lastError = null;
           break;
         } catch (e) {

@@ -23,11 +23,13 @@ export type LoadedImage = {
  * Скачивает картинку и приводит к JPEG ≤ 1024 px. Возвращает null при любой ошибке:
  * таймаут, не-изображение, слишком большой файл, нечитаемый формат.
  */
-export async function loadImage(url: string, userAgent: string): Promise<LoadedImage | null> {
+export async function loadImage(url: string, userAgent: string, signal?: AbortSignal): Promise<LoadedImage | null> {
   try {
     const res = await fetch(url, {
       headers: { "User-Agent": userAgent, Accept: "image/*" },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)])
+        : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       redirect: "follow",
     });
     if (!res.ok) return null;

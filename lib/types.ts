@@ -5,8 +5,8 @@
 export type TrustTier = "verified" | "probable" | "unverified";
 
 /** Режим сборки профиля.
- *  quick — быстрый взгляд: по одному-двум снимкам на категорию, только главная
- *  страница сайта, укороченный план запросов. Задача — показать вуз целиком и сразу.
+ *  quick — быстрый взгляд: максимальная проверенная подборка за собственный
+ *  30-секундный бюджет с приоритетом покрытия семи основных категорий.
  *  deep — полный сбор по запросу пользователя: больше запросов, глубокий обход
  *  сайта, больше снимков в каждой категории. Разделение нужно, чтобы не тратить
  *  время и квоты на тех, кому хватило первого взгляда. */
@@ -233,6 +233,15 @@ export type DeepContext = {
 
 export type ProgressEvent =
   | { stage: "photo"; photo: PhotoItem }
+  | {
+      stage: "stats";
+      discovered: number;
+      downloaded: number;
+      checked: number;
+      accepted: number;
+      remainingMs: number;
+      stopReason?: CollectionStopReason;
+    }
   | { stage: "anchor"; source: AnchorSource }
   | { stage: "places"; found: number }
   | { stage: "official"; found: number; error: string | null }
@@ -243,6 +252,15 @@ export type ProgressEvent =
   | { stage: "dedupe"; kept: number; duplicates: number }
   | { stage: "vision"; batches: number }
   | { stage: "done" };
+
+export type CollectionStopReason = "sources_exhausted" | "deadline_reached";
+
+export type CollectionStats = {
+  discovered: number;
+  downloaded: number;
+  checked: number;
+  accepted: number;
+};
 
 export type Profile = {
   mode: ProfileMode;
@@ -266,6 +284,8 @@ export type Profile = {
   visionAvailable: boolean;
   warnings: string[];
   timingMs: number;
+  collectionStats: CollectionStats;
+  stopReason: CollectionStopReason;
   /** Возраст сохранённого профиля при повторном открытии. */
   cacheAgeMs?: number;
 };

@@ -29,13 +29,16 @@ const ROBOTS_TIMEOUT_MS = 4000;
 /** Общий потолок на чтение внутренних страниц. Дальше обход прекращается, сколько бы
  *  страниц ни осталось: 30-секундный бюджет профиля важнее полноты обхода, а
  *  непрочитанное честно попадает в оговорки. */
-const INNER_PAGES_BUDGET_MS = 9000;
+const QUICK_INNER_PAGES_BUDGET_MS = 16_000;
+const DEEP_INNER_PAGES_BUDGET_MS = 70_000;
 const MAX_HTML_BYTES = 3_000_000;
 /** Общий бюджет кандидатов. Больше загрузок — дольше сборка профиля. */
-const MAX_CANDIDATES = 32;
+const QUICK_MAX_CANDIDATES = 96;
+const DEEP_MAX_CANDIDATES = 500;
 /** Сколько внутренних страниц открываем сверх главной. Верхняя граница мягкая:
  *  реальный ограничитель — потолок времени, а не это число. */
-const MAX_INNER_PAGES = 9;
+const MAX_QUICK_INNER_PAGES = 8;
+const MAX_DEEP_INNER_PAGES = 40;
 /** Сколько из них отдаём общим галереям; остальное — под разделы по категориям. */
 const MAX_GENERAL_PAGES = 3;
 /** Страниц новостей и событий: у них есть дата публикации, которой больше взять негде. */
@@ -43,7 +46,6 @@ const MAX_NEWS_PAGES = 3;
 /** Быстрый взгляд читает главную и до трёх тематических страниц. Они загружаются
  *  одной параллельной пачкой, поэтому это даёт библиотеку, спорт и общежитие без
  *  трёх последовательных ожиданий. */
-const MAX_QUICK_INNER_PAGES = 3;
 /** Сколько страниц сайта запрашиваем одновременно: у вузовских серверов бывает
  *  немного ресурсов, и восемь одновременных запросов — заметная для них нагрузка.
  *  Три — компромисс между вежливостью и числом последовательных кругов ожидания. */
@@ -263,8 +265,9 @@ function selectInnerLinks(html: string, pageUrl: string, deep: boolean): string[
 
   const picked: string[] = [];
   const seen = new Set<string>();
+  const pageLimit = deep ? MAX_DEEP_INNER_PAGES : MAX_QUICK_INNER_PAGES;
   const take = (url: string) => {
-    if (seen.has(url) || picked.length >= MAX_INNER_PAGES) return;
+    if (seen.has(url) || picked.length >= pageLimit) return;
     seen.add(url);
     picked.push(url);
   };
@@ -368,11 +371,13 @@ function parseRobots(text: string, token: string): Omit<RobotsRules, "source"> {
   return mine ?? { allow: [], disallow: [], crawlDelayMs: null };
 }
 
-async function fetchRobots(origin: string, userAgent: string): Promise<RobotsRules> {
+async function fetchRobots(origin: string, userAgent: string, signal?: AbortSignal): Promise<RobotsRules> {
   try {
     const res = await fetch(`${origin}/robots.txt`, {
       headers: { "User-Agent": userAgent, Accept: "text/plain" },
-      signal: AbortSignal.timeout(ROBOTS_TIMEOUT_MS),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(ROBOTS_TIMEOUT_MS)])
+        : AbortSignal.timeout(ROBOTS_TIMEOUT_MS),
       redirect: "follow",
     });
     // 404 и прочие 4xx означают «правил нет» — это штатный ответ, а не сбой.
@@ -431,6 +436,7 @@ async function fetchPage(
   userAgent: string,
   timeoutMs: number,
   canFetch: (url: string) => Promise<boolean>,
+  signal?: AbortSignal,
 ): Promise<FetchedPage | { error: string }> {
   try {
     let current = url;
@@ -442,7 +448,9 @@ async function fetchPage(
         Accept: "text/html,application/xhtml+xml",
         "Accept-Language": "ru,kk,en,zh,ko,ja",
       },
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+        : AbortSignal.timeout(timeoutMs),
       redirect: "manual",
     });
       if (res.status >= 300 && res.status < 400) {
@@ -501,7 +509,7 @@ export function pageDate(html: string, pageUrl: string): string | null {
 export async function collectOfficialImages(
   officialWebsite: string,
   userAgent: string,
-  opts: { deep: boolean; maxCandidates?: number } = { deep: true },
+  opts: { deep: boolean; maxCandidates?: number; budgetMs?: number; signal?: AbortSignal } = { deep: true },
 ): Promise<OfficialResult> {
   let homeUrl: string;
   let origin: string;
@@ -515,14 +523,14 @@ export async function collectOfficialImages(
 
   // robots.txt читаем ДО первой страницы: спрашивать разрешение после того, как уже
   // зашёл, смысла не имеет.
-  const robots = await fetchRobots(origin, userAgent);
+  const robots = await fetchRobots(origin, userAgent, opts.signal);
   const officialHost = new URL(homeUrl).hostname;
   const robotsByOrigin = new Map<string, Promise<RobotsRules>>([[origin, Promise.resolve(robots)]]);
   const rulesFor = (url: string): Promise<RobotsRules> => {
     const targetOrigin = new URL(url).origin;
     let pending = robotsByOrigin.get(targetOrigin);
     if (!pending) {
-      pending = fetchRobots(targetOrigin, userAgent);
+      pending = fetchRobots(targetOrigin, userAgent, opts.signal);
       robotsByOrigin.set(targetOrigin, pending);
     }
     return pending;
@@ -555,37 +563,56 @@ export async function collectOfficialImages(
     };
   }
 
-  const home = await fetchPage(homeUrl, userAgent, HOME_TIMEOUT_MS, canFetch);
+  const home = await fetchPage(homeUrl, userAgent, HOME_TIMEOUT_MS, canFetch, opts.signal);
   if ("error" in home) return { candidates: [], pagesVisited: [], blockedByRobots, robotsNote, skippedForTime: 0, error: home.error };
 
   const pages: FetchedPage[] = [home];
 
   // Внутренние страницы: сначала отбрасываем закрытые в robots.txt, затем читаем
   // небольшими группами, а если сайт просил паузу — по одной с этой паузой.
-  const selected = selectInnerLinks(home.html, home.url, opts.deep);
-  const links: string[] = [];
-  for (const l of selected) {
-    if (await canFetch(l)) links.push(l);
-    else blockedByRobots.push(l);
-  }
-
-  const delay = Math.max(0, ...await Promise.all(links.map(async (l) => (await rulesFor(l)).crawlDelayMs ?? 0)));
-  const allowedByBudget = delay > 0 ? Math.max(0, Math.floor(CRAWL_DELAY_BUDGET_MS / delay)) : links.length;
-  const toVisit = links.slice(0, allowedByBudget);
-  const batchSize = delay > 0 ? 1 : PAGE_CONCURRENCY;
-
-  // Часы включаются здесь: медленный сайт не должен утащить за собой весь профиль.
+  const pageLimit = opts.deep ? MAX_DEEP_INNER_PAGES : MAX_QUICK_INNER_PAGES;
+  const queue = selectInnerLinks(home.html, home.url, opts.deep);
+  const queued = new Set<string>([home.url, ...queue]);
+  const crawlBudgetMs = Math.max(0, opts.budgetMs ?? (opts.deep ? DEEP_INNER_PAGES_BUDGET_MS : QUICK_INNER_PAGES_BUDGET_MS));
   const startedAt = Date.now();
+  let delaySpent = 0;
   let skippedForTime = 0;
-  for (let i = 0; i < toVisit.length; i += batchSize) {
-    if (Date.now() - startedAt > INNER_PAGES_BUDGET_MS) {
-      skippedForTime = toVisit.length - i;
+
+  while (queue.length > 0 && pages.length - 1 < pageLimit && !opts.signal?.aborted) {
+    if (Date.now() - startedAt >= crawlBudgetMs) {
+      skippedForTime = queue.length;
       break;
     }
-    if (delay > 0 && i > 0) await new Promise((r) => setTimeout(r, delay));
-    const batch = await Promise.all(toVisit.slice(i, i + batchSize).map((l) => fetchPage(l, userAgent, INNER_TIMEOUT_MS, canFetch)));
-    for (const page of batch) if (!("error" in page)) pages.push(page);
+    const preview = queue.slice(0, PAGE_CONCURRENCY);
+    const delay = Math.max(0, ...await Promise.all(preview.map(async (l) => (await rulesFor(l)).crawlDelayMs ?? 0)));
+    if (delay > 0 && delaySpent + delay > CRAWL_DELAY_BUDGET_MS) {
+      skippedForTime = queue.length;
+      break;
+    }
+    const batchSize = delay > 0 ? 1 : PAGE_CONCURRENCY;
+    const batchLinks = queue.splice(0, Math.min(batchSize, pageLimit - (pages.length - 1)));
+    if (delay > 0 && pages.length > 1) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delaySpent += delay;
+    }
+    const allowed: string[] = [];
+    for (const link of batchLinks) {
+      if (await canFetch(link)) allowed.push(link);
+      else blockedByRobots.push(link);
+    }
+    const batch = await Promise.all(allowed.map((link) => fetchPage(link, userAgent, INNER_TIMEOUT_MS, canFetch, opts.signal)));
+    for (const page of batch) {
+      if ("error" in page) continue;
+      pages.push(page);
+      if (!opts.deep || pages.length - 1 >= pageLimit) continue;
+      for (const child of selectInnerLinks(page.html, page.url, true)) {
+        if (queued.has(child)) continue;
+        queued.add(child);
+        queue.push(child);
+      }
+    }
   }
+  if (queue.length > 0 && skippedForTime === 0) skippedForTime = queue.length;
 
   // Бюджет кандидатов делим между страницами по кругу. Иначе баннеры и иконки главной
   // занимают его целиком, и до галереи, ради которой обход и затевался, дело не доходит.
@@ -602,7 +629,7 @@ export async function collectOfficialImages(
   const candidates: OfficialCandidate[] = [];
   // Кандидатов набираем ровно столько, сколько профиль способен использовать: каждый
   // лишний — это скачанный и выброшенный файл, то есть потраченные секунды.
-  const budget = Math.max(1, opts.maxCandidates ?? MAX_CANDIDATES);
+  const budget = Math.max(1, opts.maxCandidates ?? (opts.deep ? DEEP_MAX_CANDIDATES : QUICK_MAX_CANDIDATES));
   for (let i = 0; candidates.length < budget; i++) {
     let anyLeft = false;
     for (const list of perPage) {
