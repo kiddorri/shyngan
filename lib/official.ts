@@ -40,8 +40,10 @@ const MAX_INNER_PAGES = 9;
 const MAX_GENERAL_PAGES = 3;
 /** Страниц новостей и событий: у них есть дата публикации, которой больше взять негде. */
 const MAX_NEWS_PAGES = 3;
-/** Быстрый взгляд читает главную и максимум одну страницу: он должен быть быстрым. */
-const MAX_QUICK_INNER_PAGES = 1;
+/** Быстрый взгляд читает главную и до трёх тематических страниц. Они загружаются
+ *  одной параллельной пачкой, поэтому это даёт библиотеку, спорт и общежитие без
+ *  трёх последовательных ожиданий. */
+const MAX_QUICK_INNER_PAGES = 3;
 /** Сколько страниц сайта запрашиваем одновременно: у вузовских серверов бывает
  *  немного ресурсов, и восемь одновременных запросов — заметная для них нагрузка.
  *  Три — компромисс между вежливостью и числом последовательных кругов ожидания. */
@@ -120,7 +122,7 @@ const DATED_URL = /\/20\d\d[/-]/;
 const CATEGORY_LINKS: Array<{ key: string; re: RegExp }> = [
   { key: "library", re: /библиотек|кітапхана|kitapkhana|librar|图书馆|圖書館|도서관|図書館/i },
   { key: "sport", re: /спорт|спорткомплекс|бассейн|стадион|sport|gym|stadium|体育|體育|체육|スポーツ/i },
-  { key: "dorm", re: /общежит|жатақхана|zhatakhana|dormitor|hostel|宿舍|기숙사|学生寮/i },
+  { key: "dorm", re: /общежит|жатақхана|zhatakhana|dormitor|hostel|residen|housing|living.?on.?campus|宿舍|기숙사|学生寮/i },
   { key: "lab", re: /лаборатор|laborator|实验室|實驗室|연구실|研究室/i },
   { key: "canteen", re: /столов|асхана|ashana|буфет|canteen|cafeteria|dining|食堂|학생식당/i },
   { key: "lecture", re: /аудитори|учебн.{0,3}корпус|лекцион|classroom|lecture.?hall|教室|강의실/i },
@@ -268,8 +270,14 @@ function selectInnerLinks(html: string, pageUrl: string, deep: boolean): string[
   };
 
   if (!deep) {
-    // Быстрый взгляд: одна страница сверх главной, и только самая явная галерея.
-    for (const url of general.slice(0, 1)) take(url);
+    // Сначала страницы конкретных объектов. Общий раздел «Campus services» часто
+    // стоит раньше библиотеки и общежития, но почти не даёт полезных кадров.
+    for (const { re } of CATEGORY_LINKS) {
+      const hit = links.find((l) => re.test(l.haystack) && !seen.has(l.url));
+      if (hit) take(hit.url);
+    }
+    // Если тематических разделов мало, добираем галереями и campus life.
+    for (const url of general) take(url);
     return picked.slice(0, MAX_QUICK_INNER_PAGES);
   }
 

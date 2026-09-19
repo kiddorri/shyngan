@@ -702,7 +702,7 @@ for (const c of quickProfile.coverage) {
 }
 // И он не должен уходить вглубь сайта: одна страница сверх главной.
 const quickPages = quickProfile.warnings.find((w: string) => w.includes("прочитано страниц"));
-assert.ok(!quickPages || /страниц — [12] /.test(quickPages), `быстрый взгляд читает слишком много: ${quickPages}`);
+assert.ok(!quickPages || /страниц — [1-4] /.test(quickPages), `быстрый взгляд читает слишком много: ${quickPages}`);
 console.log("быстрый взгляд ok:", quickProfile.photos.length, "фото против", profile.photos.length);
 
 const bad = await GET(new Request("http://localhost/api/profile?qid=abc"));

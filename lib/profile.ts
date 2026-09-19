@@ -531,7 +531,7 @@ function limitsFor(mode: ProfileMode) {
         // потолками он показывал 1-2 фотографии на категорию даже когда кандидатов
         // хватало на больше. maxDuration у /api/profile — 180 с, а быстрый обычно
         // укладывается в 10-15 — запас есть, несколько лишних снимков его не тронут.
-        maxOfficialPhotos: 9,
+        maxOfficialPhotos: 12,
         maxPerCategory: 2,
         maxCityPhotos: 1,
         maxCitywidePhotos: 1,
@@ -937,7 +937,8 @@ export async function buildProfile(
       const attempted = new Set<string>();
       const covered = new Set<Category>();
       const queues = new Map<Category, Loaded[]>(QUICK_CATEGORIES.map((c) => [c, kept.filter((k) => k.raw.category === c)]));
-      const officialExtras = kept.filter((k) => k.raw.source === "official_site").slice(1, 5);
+      const officialWildcards = kept.filter((k) => k.raw.source === "official_site");
+      const streamedByCategory = new Map<Category, number>();
       for (let round = 0; round < 3 && timeLeft() > 2500; round++) {
         const selection: Loaded[] = [];
         for (const category of QUICK_CATEGORIES) {
@@ -945,11 +946,14 @@ export async function buildProfile(
           const candidate = queues.get(category)?.find((k) => !attempted.has(k.raw.id));
           if (candidate) selection.push(candidate);
         }
-        // Official pages have no reliable category metadata. Inspect a few as
-        // wildcards while some categories remain empty.
-        if (round > 0 && covered.size < QUICK_CATEGORIES.length) {
-          const extra = officialExtras.find((k) => !attempted.has(k.raw.id));
-          if (extra && !selection.includes(extra)) selection.push(extra);
+        // Official pages have no reliable category metadata. Inspect several as
+        // wildcards in the same parallel AI call: otherwise a site may expose many
+        // useful photos while Quick Board checks only one banner per round.
+        if (covered.size < QUICK_CATEGORIES.length) {
+          for (const extra of officialWildcards) {
+            if (selection.length >= 8) break;
+            if (!attempted.has(extra.raw.id) && !selection.includes(extra)) selection.push(extra);
+          }
         }
         if (!selection.length) break;
         selection.forEach((k) => attempted.add(k.raw.id));
@@ -974,6 +978,9 @@ export async function buildProfile(
             ...(category !== v.category ? [`На фото виден фасад; тип здания подтверждён названием места «${raw.evidence.placeName}»`] : []),
             ...(category !== raw.category ? [`Категория по содержимому: «${category}» (по запросу было «${raw.category}»)`] : []),
           ];
+          const alreadyStreamed = streamedByCategory.get(category) ?? 0;
+          if (alreadyStreamed >= limits.maxPerCategory) return;
+          streamedByCategory.set(category, alreadyStreamed + 1);
           onProgress({ stage: "photo", photo: {
             id: raw.id, source: raw.source, imageUrl: raw.imageUrl,
             sourceUrl: raw.sourceUrl, attribution: raw.attribution, license: raw.license,
